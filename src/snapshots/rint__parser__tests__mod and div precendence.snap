@@ -1,0 +1,5 @@
+---
+source: src/parser.rs
+expression: "format!(\"{}={} {}\", s, expected, &expr.0)"
+---
+4%2+3/3=1 ((4 % 2) + (3 / 3))
