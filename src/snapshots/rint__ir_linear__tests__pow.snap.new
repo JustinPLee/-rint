@@ -1,0 +1,14 @@
+---
+source: src/ir_linear.rs
+assertion_line: 799
+expression: "format!(\"{module}\")"
+---
+fn pow(t0, t1):
+    if t1 == 0 jump L0 else jump L1
+    L0:
+    return 1
+    L1:
+    t2 ← t1 sub 1
+    t3 ← call pow(t0, t2)
+    t4 ← t0 mul t3
+    return t4

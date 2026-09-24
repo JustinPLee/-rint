@@ -1,0 +1,76 @@
+---
+source: src/liveness.rs
+assertion_line: 404
+expression: display
+---
+0: t0 ← 1
+  uses: []
+  defs: [t0]
+  live_in: []
+  live_out: [t0]
+
+1: if t0 == 1 jump L0 else jump L2
+  uses: [t0]
+  defs: []
+  live_in: [t0]
+  live_out: [t0]
+
+2: L2:
+  uses: []
+  defs: []
+  live_in: [t0]
+  live_out: [t0]
+
+3: t1 ← 2
+  uses: []
+  defs: [t1]
+  live_in: [t0]
+  live_out: [t0, t1]
+
+4: jump L1
+  uses: []
+  defs: []
+  live_in: [t0, t1]
+  live_out: [t0, t1]
+
+5: L0:
+  uses: []
+  defs: []
+  live_in: [t0]
+  live_out: [t0]
+
+6: t1 ← 3
+  uses: []
+  defs: [t1]
+  live_in: [t0]
+  live_out: [t0, t1]
+
+7: jump L1
+  uses: []
+  defs: []
+  live_in: [t0, t1]
+  live_out: [t0, t1]
+
+8: L1:
+  uses: []
+  defs: []
+  live_in: [t0, t1]
+  live_out: [t0, t1]
+
+9: t2 ← t0 add t1
+  uses: [t0, t1]
+  defs: [t2]
+  live_in: [t0, t1]
+  live_out: [t2]
+
+10: res0 ← t2
+  uses: [t2]
+  defs: [res0]
+  live_in: [t2]
+  live_out: [res0]
+
+11: return
+  uses: [res0]
+  defs: []
+  live_in: [res0]
+  live_out: []
