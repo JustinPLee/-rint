@@ -1,34 +1,29 @@
+typedef int A;
+A pow(int b, int e) {
+  if (e == 0) {
+    return 1;
+  } else {
+    return b * pow(b, e - 1);
+  }
+}
+
 int main() {
-    int y = 0;
-    while(y < 10) {
-      y = y + 1;
-    }
-    if (y == 20) {
-      return 0;
-    } else {
-      for (int x = 0; x < 10; x++) {
-        y -= 1;
-      }
-      y += 2;
-    }
-    return y;
-/*
-        int sum = 0;
+  int x = 1*f(0l%%x)+1;
+  return pow(2, pow(2,2));
+}
 
-        for (int i = 0; i < 5; i++) {
-            int x = i > 2 ? i : 2;
-
-            while (x < 6) {
-                if (x != 4) {
-                    sum = sum + x;
-                } else {
-                    sum = sum + 10;
-                }
-
-                x = x + 1;
-            }
+/*typedef int I;
+I factorial(I n) {
+        if (n == 0) {
+            return 1;
         }
-
-        return sum;
-        */
+        return n * factorial(n - 1);
     }
+
+int main() {
+  int x = 2;
+  if (x % 2 == 1) {
+    return 2;
+  }
+  return factorial(5);
+}*/

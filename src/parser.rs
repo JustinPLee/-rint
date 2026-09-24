@@ -1,27 +1,28 @@
-use crate::context::Context;
-use crate::cst::{
-    AsnOp, BinOp, Control, Decl, Expr, LExpr, LStmt, LValue, PostOp, Program, Simp, Stmt, Typ, UnOp,
+// list of located tokens -> parse ast
+
+use crate::ast_parse::{
+    AsnOp, BinOp, Block, Control, Decl, Expr, GlobalDecl, LAsnOp, LBlock, LControl, LDecl, LExpr,
+    LGlobalDecl, LIdent, LParam, LProgram, LRetTyp, LSimp, LStmt, LTyp, LValue, Param, PostOp,
+    Program, RetTyp, Simp, Stmt, Typ, UnOp,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::location::{Located, Location};
+use crate::location::{Located, Location, loc};
 use crate::token::{LToken, Token};
 
-// parser -> cst -> elaboration -> ast -> ...
-
-pub struct Parser<'ctx> {
+pub struct Parser {
     tokens: Vec<LToken>,
-    ctx: &'ctx mut Context,
+    errors: Vec<ParseError>,
+    last_location: Location,
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(Eq, PartialEq, Clone, Debug)]
 pub enum ParseErrorKind {
-    UnexpectedToken { expected: Token, found: Token },
-    UnexpectedEof { expected: Token },
-    ExpectedIdent { found: Token },
-    ExpectedIdentEof,
-    ExpectedType { found: Token },
+    UnexpectedEof,
+    UnexpectedToken,
+    InvalidIdent,
+    InvalidType,
     InvalidExpression,
-    InvalidStatement,
+    InvalidOperator,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -29,6 +30,13 @@ pub struct ParseError {
     pub kind: ParseErrorKind,
     pub description: String,
     pub location: Location,
+}
+
+type ParseResult<T> = Result<T, ParseError>;
+
+enum Infix {
+    Binary(BinOp),
+    Ternary,
 }
 
 impl From<ParseError> for Diagnostic {
@@ -41,300 +49,599 @@ impl From<ParseError> for Diagnostic {
     }
 }
 
-type ParseResult<T> = Result<T, ParseError>;
-
-impl<'ctx> Parser<'ctx> {
-    pub fn new(ctx: &'ctx mut Context, tokens: &[LToken]) -> Self {
+impl Parser {
+    pub fn new(tokens: &[LToken]) -> Self {
         let tokens = tokens.iter().cloned().rev().collect();
-        Self { tokens, ctx }
+        Self {
+            tokens,
+            errors: Vec::new(),
+            last_location: Location::default(),
+        }
     }
 
     fn peek(&self) -> Option<&Token> {
-        self.tokens.last().map(|t| &t.0)
+        self.tokens.last().map(|lt| &lt.data)
     }
 
     fn peek_next(&self) -> Option<&Token> {
-        self.tokens.iter().rev().nth(1).map(|t| &t.0)
+        self.tokens.iter().rev().nth(1).map(|lt| &lt.data)
     }
 
     fn next(&mut self) -> Option<LToken> {
-        self.tokens.pop()
+        let last_token = self.tokens.pop()?;
+        self.last_location = last_token.location.clone();
+        Some(last_token)
     }
 
-    fn current(&self) -> &LToken {
+    fn start_to_last(&self, start: Location) -> Location {
+        start.merge(&self.last_location)
+    }
+
+    fn current_token(&self) -> &LToken {
         self.tokens.last().expect("EOF token always present")
     }
 
     fn current_location(&self) -> &Location {
-        &self.current().1
+        &self.current_token().location
     }
 
     /// Consume `token` or return an error
     fn try_consume(&mut self, token: &Token) -> ParseResult<LToken> {
         match self.peek() {
-            Some(got) if got == token => Ok(self.next().expect("token was just peeked")),
+            Some(got) if got == token => Ok(self.next().expect("consumed")),
             Some(Token::Eof) => {
                 let loc = self.current_location().clone();
-                Err(self.make_error(
-                    ParseErrorKind::UnexpectedEof {
-                        expected: token.clone(),
-                    },
-                    None,
-                    loc,
-                ))
+                Err(self.process_error(ParseErrorKind::UnexpectedEof, None, loc))
             }
-            Some(found) => {
-                let found = found.clone();
+            Some(_got) => {
                 let loc = self.current_location().clone();
-
-                Err(self.make_error(
-                    ParseErrorKind::UnexpectedToken {
-                        expected: token.clone(),
-                        found,
-                    },
-                    None,
-                    loc,
-                ))
+                Err(self.process_error(ParseErrorKind::UnexpectedToken, None, loc))
             }
             None => unreachable!("EOF token always present"),
         }
     }
 
-    fn emit_error(&mut self, err: ParseError) {
-        self.ctx.emit_diag(err.into());
+    pub fn errors(&self) -> Option<&[ParseError]> {
+        if self.errors.is_empty() {
+            None
+        } else {
+            Some(&self.errors)
+        }
     }
 
-    fn make_error(
-        &self,
+    fn process_error(
+        &mut self,
         kind: ParseErrorKind,
         description: Option<String>,
         location: Location,
     ) -> ParseError {
         let base_description = match &kind {
-            ParseErrorKind::UnexpectedToken { expected, found } => format!(
-                "expected `{}`, but found `{}`",
-                expected.show(),
-                found.show(),
-            ),
-            ParseErrorKind::UnexpectedEof { expected } => {
-                format!("expected `{}`, but found EOF", expected.show(),)
-            }
-            ParseErrorKind::ExpectedIdent { found } => {
-                format!("expected identifier, but found `{}`", found.show(),)
-            }
-            ParseErrorKind::ExpectedType { found } => {
-                format!("expected type, but found `{}`", found.show(),)
-            }
-            ParseErrorKind::ExpectedIdentEof => "expected identifier, but found EOF".into(),
-            ParseErrorKind::InvalidExpression => "invalid expression".into(),
-            ParseErrorKind::InvalidStatement => "invalid statement".into(),
+            ParseErrorKind::UnexpectedEof => "unexpected EOF".to_string(),
+            ParseErrorKind::InvalidIdent => "invalid identifier".to_string(),
+            ParseErrorKind::InvalidType => "invalid type".to_string(),
+            ParseErrorKind::UnexpectedToken => "unexpected token".to_string(),
+            ParseErrorKind::InvalidExpression => "invalid expression".to_string(),
+            ParseErrorKind::InvalidOperator => "invalid operator".to_string(),
         };
         let concatted_description = if let Some(description) = description {
-            format!("{} -- expected {}", base_description, description)
+            format!(
+                "{} -> {:?} -- expected {}",
+                base_description,
+                self.current_token().data,
+                description
+            )
         } else {
             base_description
         };
-        ParseError {
+        let err = ParseError {
             kind,
             description: concatted_description,
             location,
+        };
+        self.errors.push(err.clone());
+        self.synchronize();
+        err
+    }
+
+    fn parse_program(&mut self) -> ParseResult<LProgram> {
+        let start = self.current_location().clone();
+        let mut gdecls = Vec::new();
+        while matches!(
+            self.peek(),
+            Some(Token::Typedef | Token::Int | Token::Bool | Token::Void | Token::Ident(_))
+        ) {
+            let decl = match self.peek() {
+                Some(Token::Typedef) => self.parse_typedef()?,
+                _ => self.parse_fun_def()?,
+            };
+            gdecls.push(decl);
+        }
+        let location = if gdecls.is_empty() {
+            start
+        } else {
+            self.start_to_last(start)
+        };
+        Ok(loc(Program(gdecls), location))
+    }
+
+    fn parse_typedef(&mut self) -> ParseResult<LGlobalDecl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::Typedef)?;
+        let typ = self.parse_typ()?;
+        let alias = self.parse_ident()?;
+        self.try_consume(&Token::Semicolon)?;
+        Ok(loc(
+            GlobalDecl::Typedef { typ, alias },
+            self.start_to_last(start),
+        ))
+    }
+
+    fn parse_fun_def(&mut self) -> ParseResult<LGlobalDecl> {
+        let start = self.current_location().clone();
+
+        let ret_typ = self.parse_ret_typ()?;
+        let name = self.parse_ident()?;
+        let params = self.parse_params()?;
+        let body = match self.peek() {
+            Some(Token::Semicolon) => {
+                self.next();
+                GlobalDecl::FunDef {
+                    ret_typ,
+                    name,
+                    params,
+                    body: None,
+                }
+            }
+            Some(Token::LBrace) => {
+                let body = self.parse_block()?;
+                GlobalDecl::FunDef {
+                    ret_typ,
+                    name,
+                    params,
+                    body: Some(body),
+                }
+            }
+            _ => {
+                let location = self.current_location().clone();
+                return Err(self.process_error(
+                    ParseErrorKind::UnexpectedToken,
+                    Some("function declaration or definition".to_string()),
+                    location,
+                ));
+            }
+        };
+        Ok(loc(body, self.start_to_last(start)))
+    }
+
+    fn parse_ret_typ(&mut self) -> ParseResult<LRetTyp> {
+        match self.peek() {
+            Some(Token::Void) => {
+                let token = self.try_consume(&Token::Void)?;
+                Ok(loc(RetTyp::Void, token.location))
+            }
+            _ => {
+                let typ = self.parse_typ()?;
+                let location = typ.location.clone();
+                Ok(loc(RetTyp::Typ(typ), location))
+            }
         }
     }
 
-    fn parse_program(&mut self) -> ParseResult<Program> {
-        self.try_consume(&Token::Int)?;
-        self.try_consume(&Token::Ident("main".to_string()))?;
-        self.try_consume(&Token::LParen)?;
-        self.try_consume(&Token::RParen)?;
+    fn parse_params(&mut self) -> ParseResult<Vec<LParam>> {
+        if matches!(
+            (self.peek(), self.peek_next()),
+            (Some(Token::LParen), Some(Token::RParen))
+        ) {
+            self.next(); // (
+            self.next(); // )
+            return Ok(Vec::new());
+        }
 
-        self.parse_block().map(Program)
+        self.try_consume(&Token::LParen)?;
+
+        let mut params = vec![self.parse_param()?];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.try_consume(&Token::Comma)?;
+            params.push(self.parse_param()?);
+        }
+
+        self.try_consume(&Token::RParen)?;
+        Ok(params)
     }
 
-    fn parse_block(&mut self) -> ParseResult<Vec<LStmt>> {
+    fn parse_assert(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+
+        self.try_consume(&Token::Assert)?;
+
+        self.try_consume(&Token::LParen)?;
+        let expr = self.parse_expr()?;
+        self.try_consume(&Token::RParen)?;
+
+        self.try_consume(&Token::Semicolon)?;
+        Ok(loc(Control::Assert(expr), self.start_to_last(start)))
+    }
+
+    fn parse_param(&mut self) -> ParseResult<LParam> {
+        let start = self.current_location().clone();
+        let typ = self.parse_typ()?;
+        let name = self.parse_ident()?;
+        Ok(loc(Param { typ, name }, self.start_to_last(start)))
+    }
+
+    fn parse_block(&mut self) -> ParseResult<LBlock> {
+        let start = self.current_location().clone();
         self.try_consume(&Token::LBrace)?;
         let stmts = self.parse_stmts()?;
         self.try_consume(&Token::RBrace)?;
-        Ok(stmts)
+        Ok(loc(Block(stmts), self.start_to_last(start)))
     }
 
     fn parse_stmts(&mut self) -> ParseResult<Vec<LStmt>> {
         let mut stmts = Vec::new();
+
         while !matches!(self.peek(), Some(Token::RBrace) | Some(Token::Eof) | None) {
-            stmts.push(self.parse_stmt()?);
+            if let Ok(stmt) = self.parse_stmt() {
+                stmts.push(stmt);
+            }
         }
 
         Ok(stmts)
     }
 
-    fn parse_typ(&mut self) -> ParseResult<Typ> {
+    fn parse_typ(&mut self) -> ParseResult<LTyp> {
         match self.peek() {
             Some(Token::Int) => {
-                self.try_consume(&Token::Int)?;
-                Ok(Typ::Int)
+                let token = self.try_consume(&Token::Int)?;
+                Ok(loc(Typ::Int, token.location))
             }
             Some(Token::Bool) => {
-                self.try_consume(&Token::Bool)?;
-                Ok(Typ::Bool)
+                let token = self.try_consume(&Token::Bool)?;
+                Ok(loc(Typ::Bool, token.location))
             }
-            None | _ => panic!("error todo"),
-        }
-    }
-
-    fn parse_stmt(&mut self) -> ParseResult<LStmt> {
-        let start = self.current_location().clone();
-        match self.peek() {
-            Some(Token::If) | Some(Token::While) | Some(Token::For) | Some(Token::Return) => {
-                let stmt = self.parse_control()?;
-                Ok(Located(Stmt::Control(stmt), start))
+            Some(Token::Ident(_)) => {
+                let token = self.parse_ident()?;
+                Ok(loc(Typ::Named(token.data), token.location))
             }
-            Some(Token::LBrace) => {
-                let stmts = self.parse_block()?;
-                let end = self.current_location().clone();
-                Ok(Located(Stmt::Block(stmts), start.merge(&end)))
-            }
-            _ => {
-                let end = self.current_location().clone();
-                let loc = start.merge(&end);
-                let res = Ok(Located(Stmt::Simp(self.parse_simp()?), loc));
-                self.try_consume(&Token::Semicolon)?;
-                res
-            }
-        }
-    }
-
-    fn parse_control(&mut self) -> ParseResult<Control> {
-        match self.peek() {
-            Some(Token::If) => {
-                self.try_consume(&Token::If)?;
-                self.try_consume(&Token::LParen)?;
-                let cond = self.parse_expr()?;
-                self.try_consume(&Token::RParen)?;
-                let true_stmt = Box::new(self.parse_stmt()?);
-                if self.try_consume(&Token::Else).is_ok() {
-                    let false_stmt = Box::new(self.parse_stmt()?);
-                    return Ok(Control::If {
-                        cond,
-                        true_stmt,
-                        false_stmt,
-                    });
-                }
-                panic!("if statements must have else");
-            }
-            Some(Token::While) => {
-                self.try_consume(&Token::While)?;
-                self.try_consume(&Token::LParen)?;
-                let cond = self.parse_expr()?;
-                self.try_consume(&Token::RParen)?;
-                let body = Box::new(self.parse_stmt()?);
-                Ok(Control::While { cond, body })
-            }
-            Some(Token::For) => {
-                self.try_consume(&Token::For)?;
-                self.try_consume(&Token::LParen)?;
-                let init = self.parse_simp().ok();
-                self.try_consume(&Token::Semicolon)?;
-                let cond = self.parse_expr()?;
-                self.try_consume(&Token::Semicolon)?;
-                let step = self.parse_simp().ok();
-                self.try_consume(&Token::RParen)?;
-                let body = Box::new(self.parse_stmt()?);
-                Ok(Control::For {
-                    init,
-                    cond,
-                    step,
-                    body,
-                })
-            }
-            Some(Token::Return) => {
-                self.try_consume(&Token::Return)?;
-                let expr = self.parse_expr()?;
-                self.try_consume(&Token::Semicolon)?;
-                Ok(Control::Return(expr))
-            }
-            _ => panic!("error todo"),
-        }
-    }
-
-    fn parse_simp(&mut self) -> ParseResult<Simp> {
-        match self.peek() {
-            Some(Token::Int | Token::Bool) => {
-                let decl = self.parse_decl()?;
-                Ok(Simp::Decl(decl))
-            }
-            Some(Token::Ident(_)) => match self.peek_next() {
-                Some(Token::DoubleMinus) | Some(Token::DoublePlus) => self.parse_postfix(),
-                _ => {
-                    let name = self.parse_lvalue()?;
-                    let asnop = self.parse_asnop()?;
-                    let value = self.parse_expr()?;
-                    Ok(Simp::Assign { name, asnop, value })
-                }
-            },
-            _ => Ok(Simp::StmtExpr(self.parse_expr()?)),
-        }
-    }
-
-    fn parse_decl(&mut self) -> ParseResult<Decl> {
-        let typ = self.parse_typ()?;
-        let name = self.parse_ident()?;
-        if self.try_consume(&Token::Eq).is_ok() {
-            let value = self.parse_expr()?;
-            Ok(Decl::Init { typ, name, value })
-        } else {
-            Ok(Decl::Decl { typ, name })
-        }
-    }
-
-    fn parse_postfix(&mut self) -> ParseResult<Simp> {
-        let lvalue = self.parse_lvalue()?;
-        let postop = match self.next() {
-            Some(Located(Token::DoubleMinus, _)) => PostOp::DoubleMinus,
-            Some(Located(Token::DoublePlus, _)) => PostOp::DoublePlus, // Some(Token::DoublePlus) => {},
-            _ => panic!("error todo"),
-        };
-        Ok(Simp::Post {
-            name: lvalue,
-            postop,
-        })
-    }
-
-    fn parse_ident(&mut self) -> ParseResult<String> {
-        match self.next() {
-            Some(Located(Token::Ident(s), _)) => Ok(s),
-            Some(Located(tok, loc)) => {
-                Err(self.make_error(ParseErrorKind::ExpectedIdent { found: tok }, None, loc))
-            }
-            None => Err(self.make_error(
-                ParseErrorKind::ExpectedIdentEof,
+            None => Err(self.process_error(
+                ParseErrorKind::UnexpectedEof,
+                None,
+                self.current_location().clone(),
+            )),
+            _ => Err(self.process_error(
+                ParseErrorKind::InvalidType,
                 None,
                 self.current_location().clone(),
             )),
         }
     }
 
-    fn parse_lvalue(&mut self) -> ParseResult<LValue> {
-        match self.next() {
-            Some(Located(Token::Ident(name), _)) => Ok(LValue(name)),
-            _ => panic!("error todo"),
+    fn parse_stmt(&mut self) -> ParseResult<LStmt> {
+        let start = self.current_location().clone();
+
+        match self.peek() {
+            Some(Token::If) => {
+                let ctrl = self.parse_if()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::While) => {
+                let ctrl = self.parse_while()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::For) => {
+                let ctrl = self.parse_for()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::Return) => {
+                let ctrl = self.parse_return()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::Break) => {
+                let ctrl = self.parse_break()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::Continue) => {
+                let ctrl = self.parse_continue()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::Assert) => {
+                let ctrl = self.parse_assert()?;
+                Ok(loc(Stmt::Control(ctrl), self.start_to_last(start)))
+            }
+            Some(Token::LBrace) => {
+                let stmts = self.parse_block()?;
+                Ok(loc(Stmt::Block(stmts), self.start_to_last(start)))
+            }
+            _ => {
+                let simp = self.parse_simp()?;
+                self.try_consume(&Token::Semicolon)?;
+                Ok(loc(Stmt::Simp(simp), self.start_to_last(start)))
+            }
         }
     }
 
-    fn parse_asnop(&mut self) -> ParseResult<AsnOp> {
-        let tok = match self.next().map_or(None, |t| Some(t.0)) {
-            Some(Token::Eq) => AsnOp::Eq,
-            Some(Token::PlusEq) => AsnOp::PlusEq,
-            Some(Token::MinusEq) => AsnOp::MinusEq,
-            Some(Token::TimesEq) => AsnOp::TimesEq,
-            Some(Token::DivEq) => AsnOp::DivEq,
-            Some(Token::ModEq) => AsnOp::ModEq,
-            Some(Token::AndEq) => AsnOp::AndEq,
-            Some(Token::XorEq) => AsnOp::XorEq,
-            Some(Token::OrEq) => AsnOp::OrEq,
-            Some(Token::LShiftEq) => AsnOp::LShiftEq,
-            Some(Token::RShiftEq) => AsnOp::RShiftEq,
-            _ => panic!("error todo"),
+    fn parse_if(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::If)?;
+
+        self.try_consume(&Token::LParen)?;
+        let cond = self.parse_expr()?;
+        self.try_consume(&Token::RParen)?;
+
+        let true_block = self.parse_block()?;
+
+        if self.peek() == Some(&Token::Else) {
+            self.next();
+            let false_block = self.parse_block()?;
+            Ok(loc(
+                Control::If {
+                    cond,
+                    true_block,
+                    false_block: Some(false_block),
+                },
+                self.start_to_last(start),
+            ))
+        } else {
+            Ok(loc(
+                Control::If {
+                    cond,
+                    true_block,
+                    false_block: None,
+                },
+                self.start_to_last(start),
+            ))
+        }
+    }
+
+    fn parse_while(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::While)?;
+
+        self.try_consume(&Token::LParen)?;
+        let cond = self.parse_expr()?;
+        self.try_consume(&Token::RParen)?;
+
+        let body = self.parse_block()?; // different than spec
+        Ok(loc(
+            Control::While { cond, body },
+            self.start_to_last(start),
+        ))
+    }
+
+    fn parse_for(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::For)?;
+
+        self.try_consume(&Token::LParen)?;
+        let init = self.parse_for_init()?;
+        self.try_consume(&Token::Semicolon)?;
+
+        let cond = self.parse_expr()?;
+        self.try_consume(&Token::Semicolon)?;
+
+        let step = self.parse_for_step()?;
+        self.try_consume(&Token::RParen)?;
+
+        let body = self.parse_block()?; // different than spec
+        Ok(loc(
+            Control::For {
+                init,
+                cond,
+                step,
+                body,
+            },
+            self.start_to_last(start),
+        ))
+    }
+
+    // optional
+    fn parse_for_init(&mut self) -> ParseResult<Option<LSimp>> {
+        if matches!(self.peek(), Some(Token::Semicolon)) {
+            return Ok(None);
+        }
+
+        Ok(Some(self.parse_simp()?))
+    }
+
+    // optional
+    fn parse_for_step(&mut self) -> ParseResult<Option<LSimp>> {
+        if matches!(self.peek(), Some(Token::RParen)) {
+            return Ok(None);
+        }
+
+        Ok(Some(self.parse_simp()?))
+    }
+
+    fn parse_return(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::Return)?;
+        if matches!(self.peek(), Some(Token::Semicolon)) {
+            self.try_consume(&Token::Semicolon)?;
+            Ok(loc(Control::Return(None), self.start_to_last(start)))
+        } else {
+            let expr = self.parse_expr()?;
+            self.try_consume(&Token::Semicolon)?;
+            Ok(loc(Control::Return(Some(expr)), self.start_to_last(start)))
+        }
+    }
+
+    fn parse_break(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::Break)?;
+        self.try_consume(&Token::Semicolon)?;
+        Ok(loc(Control::Break, self.start_to_last(start)))
+    }
+
+    fn parse_continue(&mut self) -> ParseResult<LControl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::Continue)?;
+        self.try_consume(&Token::Semicolon)?;
+        Ok(loc(Control::Continue, self.start_to_last(start)))
+    }
+
+    fn parse_simp(&mut self) -> ParseResult<LSimp> {
+        let start = self.current_location().clone();
+        match self.peek() {
+            Some(Token::Int | Token::Bool) => {
+                let decl = self.parse_decl()?;
+                Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
+            }
+            Some(Token::Ident(_)) => match self.peek_next() {
+                Some(Token::DoubleMinus) | Some(Token::DoublePlus) => self.parse_postfix(),
+                Some(Token::LParen) => Ok(loc(
+                    Simp::Expr(self.parse_expr()?),
+                    self.start_to_last(start),
+                )),
+                // check if the first identifier was actually a type from a typedef
+                // if so, then <ident> <ident> is the start of a variable declaration
+                Some(Token::Ident(_)) => {
+                    let decl = self.parse_decl()?;
+                    Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
+                }
+                _ => {
+                    let name = self.parse_lvalue()?;
+                    let asnop = self.parse_asnop()?;
+                    let value = self.parse_expr()?;
+                    Ok(loc(
+                        Simp::Assign { name, asnop, value },
+                        self.start_to_last(start),
+                    ))
+                }
+            },
+            _ => Ok(loc(
+                Simp::Expr(self.parse_expr()?),
+                self.start_to_last(start),
+            )),
+        }
+    }
+
+    fn parse_decl(&mut self) -> ParseResult<LDecl> {
+        let start = self.current_location().clone();
+        let typ = self.parse_typ()?;
+        let name = self.parse_ident()?;
+        if let Some(&Token::Eq) = self.peek() {
+            self.next(); // skip '='
+            let value = self.parse_expr()?;
+            Ok(loc(
+                Decl::Init { typ, name, value },
+                self.start_to_last(start),
+            ))
+        } else {
+            Ok(loc(Decl::Decl { typ, name }, self.start_to_last(start)))
+        }
+    }
+
+    fn parse_postfix(&mut self) -> ParseResult<LSimp> {
+        let start = self.current_location().clone();
+        let lvalue = self.parse_lvalue()?;
+        let postop = match self.next() {
+            Some(Located {
+                data: Token::DoubleMinus,
+                location,
+            }) => loc(PostOp::DoubleMinus, location),
+            Some(Located {
+                data: Token::DoublePlus,
+                location,
+            }) => loc(PostOp::DoublePlus, location),
+            Some(Located { location, .. }) => {
+                return Err(self.process_error(ParseErrorKind::InvalidOperator, None, location));
+            }
+            None => {
+                return Err(self.process_error(
+                    ParseErrorKind::UnexpectedEof,
+                    None,
+                    self.current_location().clone(),
+                ));
+            }
         };
-        Ok(tok)
+        Ok(loc(
+            Simp::Post {
+                name: lvalue,
+                postop,
+            },
+            self.start_to_last(start),
+        ))
+    }
+
+    fn parse_ident(&mut self) -> ParseResult<LIdent> {
+        match self.next() {
+            Some(Located {
+                data: Token::Ident(s),
+                location,
+            }) => Ok(loc(s, location)),
+            Some(Located { location, .. }) => {
+                Err(self.process_error(ParseErrorKind::InvalidIdent, None, location))
+            }
+            None => Err(self.process_error(
+                ParseErrorKind::UnexpectedEof,
+                None,
+                self.current_location().clone(),
+            )),
+        }
+    }
+
+    fn parse_call(&mut self, name: LIdent, start: Location) -> ParseResult<LExpr> {
+        self.try_consume(&Token::LParen)?;
+
+        let mut args = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+
+                if self.peek() != Some(&Token::Comma) {
+                    break;
+                }
+
+                self.next(); // comma
+            }
+        }
+
+        self.try_consume(&Token::RParen)?;
+
+        Ok(loc(Expr::FunCall { name, args }, self.start_to_last(start)))
+    }
+
+    fn parse_lvalue(&mut self) -> ParseResult<LValue> {
+        match self.next() {
+            Some(Located {
+                data: Token::Ident(name),
+                location,
+            }) => Ok(loc(name, location)),
+            Some(Located { location, .. }) => {
+                Err(self.process_error(ParseErrorKind::InvalidExpression, None, location))
+            }
+            None => Err(self.process_error(
+                ParseErrorKind::UnexpectedEof,
+                None,
+                self.current_location().clone(),
+            )),
+        }
+    }
+
+    fn parse_asnop(&mut self) -> ParseResult<LAsnOp> {
+        let token = self.next().unwrap();
+        let op = match token.data {
+            Token::Eq => AsnOp::Eq,
+            Token::PlusEq => AsnOp::PlusEq,
+            Token::MinusEq => AsnOp::MinusEq,
+            Token::TimesEq => AsnOp::TimesEq,
+            Token::DivEq => AsnOp::DivEq,
+            Token::ModEq => AsnOp::ModEq,
+            Token::AndEq => AsnOp::AndEq,
+            Token::XorEq => AsnOp::XorEq,
+            Token::OrEq => AsnOp::OrEq,
+            Token::LShiftEq => AsnOp::LShiftEq,
+            Token::RShiftEq => AsnOp::RShiftEq,
+            _ => {
+                return Err(self.process_error(
+                    ParseErrorKind::InvalidOperator,
+                    None,
+                    token.location,
+                ));
+            }
+        };
+
+        Ok(loc(op, token.location))
     }
 
     // pratt parsing
@@ -345,23 +652,24 @@ impl<'ctx> Parser<'ctx> {
     fn parse_expr_impl(&mut self, min_bp: u8) -> ParseResult<LExpr> {
         let mut lhs = self.parse_prefix()?;
 
-        loop {
-            let Some(tok) = self.peek() else { break };
+        while let Some(tok) = self.peek() {
             let Some((kind, left_bp, right_bp)) = Infix::bp(tok) else {
                 break;
             };
+
             if left_bp < min_bp {
                 break;
             }
-            self.next().unwrap();
 
+            let op_location = self.next().expect("infix was peeked").location;
             lhs = match kind {
                 Infix::Binary(op) => {
                     let rhs = self.parse_expr_impl(right_bp)?;
-                    let location = lhs.1.clone().merge(&rhs.1);
-                    Located(
+                    let location = lhs.location.clone().merge(&rhs.location);
+
+                    loc(
                         Expr::BinOp {
-                            op,
+                            op: loc(op, op_location),
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
                         },
@@ -372,8 +680,9 @@ impl<'ctx> Parser<'ctx> {
                     let true_expr = self.parse_expr_impl(right_bp)?;
                     self.try_consume(&Token::Colon)?;
                     let false_expr = self.parse_expr_impl(right_bp)?;
-                    let location = lhs.1.clone().merge(&false_expr.1);
-                    Located(
+
+                    let location = lhs.location.clone().merge(&false_expr.location);
+                    loc(
                         Expr::TernOp {
                             cond: Box::new(lhs),
                             true_expr: Box::new(true_expr),
@@ -389,111 +698,122 @@ impl<'ctx> Parser<'ctx> {
     }
 
     fn parse_prefix(&mut self) -> ParseResult<LExpr> {
-        let Located(tok, start) = self.next().ok_or_else(|| {
-            self.make_error(
+        if matches!(self.peek(), Some(Token::Eof)) {
+            let location = self.current_location().clone();
+            return Err(self.process_error(
                 ParseErrorKind::InvalidExpression,
                 Some("expression".into()),
+                location,
+            ));
+        }
+
+        let Located {
+            data: tok,
+            location: start,
+        } = self.next().ok_or_else(|| {
+            self.process_error(
+                ParseErrorKind::InvalidExpression,
+                None,
                 self.current_location().clone(),
             )
         })?;
 
         match tok {
-            Token::True => Ok(Located(Expr::True, start)),
-            Token::False => Ok(Located(Expr::False, start)),
-            Token::Num(n) => Ok(Located(Expr::Int(n), start)),
-            Token::Ident(name) => Ok(Located(Expr::Ident(name), start)),
+            Token::True => Ok(loc(Expr::True, start)),
+            Token::False => Ok(loc(Expr::False, start)),
+            Token::Num(n) => Ok(loc(Expr::Int(n), start)),
+            Token::Ident(name) if self.peek() == Some(&Token::LParen) => {
+                self.parse_call(loc(name, start.clone()), start)
+            }
+            Token::Ident(name) => Ok(loc(Expr::Ident(name), start)),
             Token::LParen => {
                 let expr = self.parse_expr()?;
-                let Located(_, end) = self.try_consume(&Token::RParen)?;
-                Ok(Located(expr.0, start.merge(&end)))
+                self.try_consume(&Token::RParen)?;
+
+                Ok(loc(expr.data, self.start_to_last(start)))
             }
             Token::Minus => {
-                let (_, right_bp) = prefix_binding_power(&Token::Minus).unwrap();
+                let right_bp = prefix_bp(&Token::Minus).unwrap();
                 let operand = self.parse_expr_impl(right_bp)?;
-                let location = start.merge(&operand.1);
-                Ok(Located(
+                let location = self.start_to_last(start.clone());
+
+                Ok(loc(
                     Expr::UnOp {
-                        op: UnOp::Negate,
+                        op: loc(UnOp::Negate, start),
                         oper: Box::new(operand),
                     },
                     location,
                 ))
             }
             Token::Exclam => {
-                let (_, right_bp) = prefix_binding_power(&Token::Exclam).unwrap();
+                let right_bp = prefix_bp(&Token::Exclam).unwrap();
                 let operand = self.parse_expr_impl(right_bp)?;
-                let location = start.merge(&operand.1);
-                Ok(Located(
+                let location = self.start_to_last(start.clone());
+
+                Ok(loc(
                     Expr::UnOp {
-                        op: UnOp::Exclam,
+                        op: loc(UnOp::Exclam, start),
                         oper: Box::new(operand),
                     },
                     location,
                 ))
             }
-            tok => Err(self.make_error(
-                ParseErrorKind::InvalidExpression,
-                Some(format!("expression, found `{}`", tok.show())),
-                start,
-            )),
+
+            _tok => Err(self.process_error(ParseErrorKind::InvalidExpression, None, start)),
         }
     }
 
-    /// "basic constructs" like types, numbers, idents should not synchronize
-    /// let higher level constructs like statements synchronize
-    // fn synchronize(&mut self) {
-    //     loop {
-    //         match self.peek_raw() {
-    //             // sensible (?) ending spots
-    //             None | Some(Token::Eof) | Some(Token::RBrace) => return,
-    //
-    //             // sensible (?) ending spots
-    //             Some(Token::Semicolon) => {
-    //                 self.next();
-    //                 return;
-    //             }
-    //
-    //             // don't consume sensible (?) starting spots
-    //             Some(Token::Int) | Some(Token::Bool) | Some(Token::Return)
-    //             | Some(Token::LParen) | Some(Token::LBrace) => return,
-    //
-    //             // consume "bad" tokens otherwise
-    //             _ => {
-    //                 self.next();
-    //             }
-    //         }
-    //     }
-    // }
+    fn synchronize(&mut self) {
+        loop {
+            match self.peek() {
+                None | Some(Token::Eof) => return,
+                Some(Token::Semicolon) | Some(Token::RBrace) => {
+                    self.next();
+                    return;
+                }
+                _ => {
+                    self.next();
+                }
+            }
+        }
+    }
 
-    pub fn parse(&mut self) -> ParseResult<Program> {
+    pub fn parse(&mut self) -> LProgram {
         self.parse_program()
+            .unwrap_or_else(|_| loc(Program(vec![]), self.current_location().clone()))
     }
 }
 
-/*
-    ()
-    ! - ++ --          (right)
-    * / %
-    + -
-    << >>
-    < <= > >=
-    == !=
-    &
-    ^
-    |
-    &&
-    ||
-    ? :
-    = += -= *= /= %=
-      &= ^= |= <<= >>= (right)
-*/
+fn prefix_bp(tok: &Token) -> Option<u8> {
+    let res = match tok {
+        Token::Minus | Token::Exclam => 25,
+        _ => return None,
+    };
 
-enum Infix {
-    Binary(BinOp),
-    Ternary,
+    Some(res)
 }
 
 impl Infix {
+    /*
+        ()
+        ! - ++ --          (right)
+        * / %
+        + -
+        << >>
+        < <= > >=
+        == !=
+        &
+        ^
+        |
+        &&
+        ||
+        ? :
+        = += -= *= /= %=
+          &= ^= |= <<= >>= (right)
+    */
+    // higher binding powers have higher precedence
+    // left_bp < right_bp means left associativity
+    // right_bp < left_bp means right associativity
     fn bp(tok: &Token) -> Option<(Self, u8, u8)> {
         let (kind, lbp, rbp) = match tok {
             Token::Question => (Self::Ternary, 4, 3),
@@ -502,45 +822,63 @@ impl Infix {
             Token::BitOr => (Self::Binary(BinOp::BitOr), 9, 10),
             Token::BitXor => (Self::Binary(BinOp::BitXor), 11, 12),
             Token::BitAnd => (Self::Binary(BinOp::BitAnd), 13, 14),
+
             Token::EqualEq => (Self::Binary(BinOp::EqualEq), 15, 16),
             Token::NotEq => (Self::Binary(BinOp::NotEq), 15, 16),
+
             Token::Less => (Self::Binary(BinOp::Less), 17, 18),
             Token::LessEq => (Self::Binary(BinOp::LessEq), 17, 18),
             Token::Greater => (Self::Binary(BinOp::Greater), 17, 18),
             Token::GreaterEq => (Self::Binary(BinOp::GreaterEq), 17, 18),
+
             Token::LShift => (Self::Binary(BinOp::LShift), 19, 20),
             Token::RShift => (Self::Binary(BinOp::RShift), 19, 20),
+
             Token::Plus => (Self::Binary(BinOp::Plus), 21, 22),
             Token::Minus => (Self::Binary(BinOp::Minus), 21, 22),
+
             Token::Times => (Self::Binary(BinOp::Times), 23, 24),
             Token::Div => (Self::Binary(BinOp::Div), 23, 24),
             Token::Mod => (Self::Binary(BinOp::Mod), 23, 24),
+
             _ => return None,
         };
+
         Some((kind, lbp, rbp))
     }
-}
-fn prefix_binding_power(tok: &Token) -> Option<(u8, u8)> {
-    let res = match tok {
-        Token::Minus | Token::Exclam => (26, 25),
-        _ => return None,
-    };
-
-    Some(res)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Context;
     use crate::lexer::Lexer;
 
-    fn new_parser<'ctx>(ctx: &'ctx mut Context, tokens: &[LToken]) -> Parser<'ctx> {
-        Parser::new(ctx, tokens)
+    fn new_parser(tokens: &[LToken]) -> Parser {
+        Parser::new(tokens)
     }
 
-    fn lex_tokens<'ctx>(ctx: &'ctx mut Context, bytes: &[u8]) -> Vec<LToken> {
-        Lexer::new(ctx, bytes).lex()
+    fn lex_tokens(bytes: &[u8]) -> Vec<LToken> {
+        Lexer::new(bytes).lex()
+    }
+
+    fn assert_parse_error(source: &str, expected: ParseErrorKind) {
+        let tokens = lex_tokens(source.as_bytes());
+        let mut parser = new_parser(&tokens);
+        parser.parse();
+
+        let Some(errors) = parser.errors() else {
+            panic!();
+        };
+        assert_eq!(errors.first().cloned().unwrap().kind, expected);
+    }
+
+    fn parse_numeric_expr(source: &str) -> i32 {
+        let tokens = lex_tokens(source.as_bytes());
+        let mut parser = new_parser(&tokens);
+        let expr = parser.parse_expr().expect("number");
+
+        assert!(matches!(parser.errors(), None));
+        interpret_expr(&expr.data)
     }
 
     // mainly for testing pratt parsing and operator precedence
@@ -551,32 +889,39 @@ mod tests {
             Expr::True => 1,
             Expr::False => 0,
             Expr::BinOp { op, lhs, rhs } => {
-                let lhs = interpret_expr(&lhs.0);
-                let rhs = interpret_expr(&rhs.0);
-                match *op {
+                let lhs = interpret_expr(&lhs.data);
+                let rhs = interpret_expr(&rhs.data);
+
+                match op.data {
                     BinOp::Plus => lhs + rhs,
                     BinOp::Minus => lhs - rhs,
                     BinOp::Times => lhs * rhs,
                     BinOp::Div => lhs / rhs,
                     BinOp::Mod => lhs % rhs,
+
                     BinOp::BitAnd => lhs & rhs,
                     BinOp::BitOr => lhs | rhs,
                     BinOp::BitXor => lhs ^ rhs,
+
                     BinOp::LogicAnd => lhs & rhs,
                     BinOp::LogicOr => lhs | rhs,
+
                     BinOp::LShift => lhs << rhs,
                     BinOp::RShift => lhs >> rhs,
+
                     BinOp::Greater => (lhs > rhs) as i32,
                     BinOp::GreaterEq => (lhs >= rhs) as i32,
                     BinOp::Less => (lhs < rhs) as i32,
                     BinOp::LessEq => (lhs <= rhs) as i32,
+
                     BinOp::EqualEq => (lhs == rhs) as i32,
                     BinOp::NotEq => (lhs != rhs) as i32,
                 }
             }
             Expr::UnOp { op, oper } => {
-                let oper = interpret_expr(&oper.0);
-                match op {
+                let oper = interpret_expr(&oper.data);
+
+                match op.data {
                     UnOp::Negate => -1 * oper,
                     UnOp::Exclam => oper ^ 1,
                 }
@@ -586,38 +931,159 @@ mod tests {
                 true_expr,
                 false_expr,
             } => {
-                let cond = interpret_expr(&cond.0);
+                let cond = interpret_expr(&cond.data);
+
                 if cond == 1 {
-                    return interpret_expr(&true_expr.0);
+                    interpret_expr(&true_expr.data)
                 } else {
-                    return interpret_expr(&false_expr.0);
+                    interpret_expr(&false_expr.data)
                 }
             }
+            Expr::FunCall { name: _, args: _ } => todo!(),
         }
     }
 
     #[test]
-    fn test_parse_numeric_expr() {
-        let test = |description, s: &str, expected| {
-            let bytes = s.as_bytes();
-            let mut ctx = Context::new(bytes);
-            let tokens = lex_tokens(&mut ctx, bytes);
-            let mut p = new_parser(&mut ctx, &tokens);
-            let expr = p.parse_expr().unwrap();
-            assert_eq!(interpret_expr(&expr.0), expected);
+    fn test_operators() {
+        let cases = [
+            ("subtraction", "10 - 3 - 2", 5),
+            ("division", "24 / 4 / 3", 2),
+            ("multiplication binds before addition", "1 + 2 * 3", 7),
+            ("bitwise precedence", "1 | 2 ^ 3 & 1", 3),
+            ("comparison binds before equality", "1 < 2 == true", 1),
+            ("bit: and binds before or", "1 | 1 & 0", 1),
+            ("unary binds before multiplication", "-2 * 3", -6),
+            ("ternary", "true ? 2 + 3 : 4 * 5", 5),
+            (
+                "ternary is right associative",
+                "false ? 1 : true ? 2 : 3",
+                2,
+            ),
+            ("mul precedence", "1+1*2", 3),
+            ("minus precedence", "-1+1*2", 1),
+            ("minus and mul", "-9*-9", 81),
+            ("div and minus", "9/-9", -1),
+            ("mod and div precendence", "4%2+3/3", 1),
+            ("parenthesis precendence left", "(1+2)*3", 9),
+            ("parenthesis precendence right", "10/(1*2)", 5),
+            ("parenthesis duplication expr", "(((1+2)))*3", 9),
+            ("parenthesis duplication atoms", "((1)/(2))", 0),
+        ];
 
-            insta::assert_yaml_snapshot!(description, format!("{}={} {}", s, expected, &expr.0),);
-        };
+        for (description, source, expected) in cases {
+            assert_eq!(
+                parse_numeric_expr(source),
+                expected,
+                "{description}: {source}"
+            );
+        }
+    }
 
-        test("mul precedence", "1+1*2", 3);
-        test("minus precedence", "-1+1*2", 1);
-        test("minus and mul", "-9*-9", 81);
-        test("div and minus", "9/-9", -1);
-        test("mod and div precendence", "4%2+3/3", 1);
+    #[test]
+    fn unexpected_eof() {
+        let source = r#"
+            int main() {
+                return 0;
+            "#;
 
-        test("parenthesis precendence left", "(1+2)*3", 9);
-        test("parenthesis precendence right", "10/(1*2)", 5);
-        test("parenthesis duplication expr", "(((1+2)))*3", 9);
-        test("parenthesis duplication atoms", "((1)/(2))", 0);
+        assert_parse_error(source, ParseErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn unexpected_token() {
+        let source = r#"
+            int main() {
+                return 0
+            }
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::UnexpectedToken);
+    }
+
+    #[test]
+    fn bad_fun_decl() {
+        let source = r#"
+            int main() 0;
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::UnexpectedToken);
+    }
+
+    #[test]
+    fn invalid_identifier() {
+        let source = r#"
+            int main(int) {
+                return 0;
+            }
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::InvalidIdent);
+    }
+
+    #[test]
+    fn invalid_type() {
+        let source = r#"
+            typedef true Alias;
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::InvalidType);
+    }
+
+    #[test]
+    fn invalid_expression() {
+        let source = r#"
+            int main() {
+                return + 1;
+            }
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::InvalidExpression);
+    }
+
+    #[test]
+    fn invalid_operator() {
+        let source = r#"
+            int main() {
+                x;
+                return 0;
+            }
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::InvalidOperator);
+    }
+
+    #[test]
+    fn invalid_statement_error_kind() {
+        let source = r#"
+            int main() {
+                int y = 0;
+                y = y++;
+            }
+            "#;
+
+        assert_parse_error(source, ParseErrorKind::UnexpectedToken);
+    }
+
+    #[test]
+    fn test_program_0() {
+        let source = r#"
+            bool xyz(Number y1);
+            typedef int Number;
+            bool xyz(Number y2) {
+                return y2 > 2;
+            }
+            int main(Number x, bool flag) {
+                Number result = flag && x > 0 ? x : 0;
+                if (result != 0 && xyz(3)) {
+                    return result;
+                } else {
+                    return 1;
+                }
+            }"#;
+        let tokens = lex_tokens(source.as_bytes());
+        let mut parser = new_parser(&tokens);
+        let program = parser.parse();
+        assert!(matches!(parser.errors(), None));
+        insta::assert_snapshot!(format!("{}", program));
     }
 }

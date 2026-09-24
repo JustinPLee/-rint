@@ -1,5 +1,0 @@
----
-source: src/parser.rs
-expression: "format!(\"{}={} {}\", s, expected, &expr.0)"
----
-"-1+1*2=1 (-(1) + (1 * 2))"

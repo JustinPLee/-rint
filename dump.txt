@@ -1,0 +1,36 @@
+# Source program:
+
+    int add(int x, int y) {
+        return x + y;
+    }
+
+    int main() {
+        return add(1);
+    }
+    
+# Lexed Tokens:
+[Int, Ident("add"), LParen, Int, Ident("x"), Comma, Int, Ident("y"), RParen, LBrace, Return, Ident("x"), Plus, Ident("y"), Semicolon, RBrace, Int, Ident("main"), LParen, RParen, LBrace, Return, Ident("add"), LParen, Num(1), RParen, Semicolon, RBrace, Eof]
+
+# Parse AST:
+(program
+  (fun_def int add [int x, int y]
+    (block
+      (return (+ x y))
+    ))
+  (fun_def int main []
+    (block
+      (return (call add 1))
+    ))
+)
+
+# AST:
+(program
+  (fun_def int add [int x, int y]
+    (block
+      (return (+ x y))
+    ))
+  (fun_def int main []
+    (block
+      (return (call add 1))
+    ))
+)

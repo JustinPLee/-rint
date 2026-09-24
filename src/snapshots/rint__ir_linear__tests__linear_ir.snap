@@ -1,0 +1,33 @@
+---
+source: src/ir_linear.rs
+expression: "format!(\"{module}\")"
+---
+fn main(t0, t1):
+    if t1 == 1 jump L3 else jump L4
+L3:
+    t5 ← t0 > 0
+    t4 ← t5
+    jump L5
+L4:
+    t4 ← 0
+    jump L5
+L5:
+    if t4 == 1 jump L0 else jump L1
+L0:
+    t3 ← t0
+    jump L2
+L1:
+    t3 ← 0
+    jump L2
+L2:
+    t2 ← t3
+    if t2 != 0 jump L6 else jump L7
+L6:
+    t6 ← t2 add 1
+    t2 ← t6
+    jump L8
+L7:
+    t2 ← 1
+    jump L8
+L8:
+    return t2

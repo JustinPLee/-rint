@@ -1,80 +1,137 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    process::Command,
-};
+use colored::Colorize;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::process::Command;
 
-use crate::{
-    analysis::typecheck, codegen::codegen, context::Context, elaborate::elaborate,
-    ir_ast_3ac::translate, lexer::Lexer, parser::Parser, registers::allocate, temps::TempGen,
-    token::Token, x86::emit_assembly,
-};
+use crate::analysis::{AnalysisError, semantic_analysis};
+use crate::cfg::analyze_cfg;
+use crate::diagnostic::report_diags;
+use crate::elaboration::elaborate;
+use crate::ir_function;
+use crate::ir_linear::translate;
+use crate::lexer::{LexError, Lexer};
+use crate::parser::{ParseError, Parser};
+use crate::token::Token;
+use crate::utils::{LabelGen, TempGen};
+use crate::x86::emit_assembly;
 
-pub struct Options {
-    pub skip_reg_alloc_use_stack: bool,
-    pub optimizations: bool, // specify levels later
+// pub struct Options {  do optimizations? dump specific phases? }
 
-    pub show_locations: bool,
+#[derive(Debug)]
+pub enum CompileError {
+    Lex(Vec<LexError>),
+    Parse(Vec<ParseError>),
+    Analysis(AnalysisError),
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            skip_reg_alloc_use_stack: false,
-            optimizations: true,
-            show_locations: false,
-        }
-    }
+pub fn compile(source: &str) -> Result<String, CompileError> {
+    compile_source("<input>", source)
 }
-pub fn compile(source: &[u8], options: &Options) -> String {
-    let mut logfile = OpenOptions::new()
+
+pub fn compile_source(filename: &str, source: &str) -> Result<String, CompileError> {
+    let mut dumpfile = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open("log.txt")
+        .open("dump.txt")
         .expect("file opened");
-    let mut ctx = Context::new(source);
 
-    let tokens = Lexer::new(&mut ctx, source).lex();
-    ctx.report_diags();
-    let untokens: Vec<Token> = tokens.iter().map(|lt| &lt.0).cloned().collect();
-    writeln!(logfile, "Lexed Tokens:\n{:?}", untokens).expect("file write");
+    writeln!(dumpfile, "# Source program:\n{}", source).expect("file write");
+    let source = source.as_bytes();
 
-    let cst = Parser::new(&mut ctx, tokens.as_slice()).parse().unwrap();
-    ctx.report_diags();
-    writeln!(logfile, "\nCST:\n{}", cst).expect("file write");
+    // Lex
+    let mut lexer = Lexer::with_file(source, filename);
+    let tokens = lexer.lex();
+    if let Some(errors) = lexer.errors() {
+        report_diags(source, errors);
+        return Err(CompileError::Lex(errors.to_vec()));
+    }
+    let raw_tokens: Vec<Token> = tokens.iter().map(|lt| &lt.data).cloned().collect();
+    writeln!(dumpfile, "# Lexed Tokens:\n{:?}", raw_tokens).expect("file write");
 
-    let ast = elaborate(cst);
-    writeln!(logfile, "\nAST:\n{}", ast).expect("file write");
+    // Parse
+    let mut parser = Parser::new(tokens.as_slice());
+    let ast_parse = parser.parse();
+    if let Some(errors) = parser.errors() {
+        report_diags(source, errors);
+        return Err(CompileError::Parse(errors.to_vec()));
+    }
+    writeln!(dumpfile, "\n# Parse AST:\n{}", ast_parse).expect("file write");
 
-    typecheck(&ast).expect("no analysis errors");
+    // Elaborate
+    let ast = elaborate(ast_parse);
+    writeln!(dumpfile, "\n# AST:\n{}", ast).expect("file write");
 
+    // Semantic Analysis
+    if let Err(err) = semantic_analysis(&ast) {
+        report_diags(source, &[err.clone()]);
+        return Err(CompileError::Analysis(err));
+    }
+
+    // IR linear code
     let mut temps = TempGen::new();
-    let three_address = translate(&ast, &mut temps);
-    writeln!(logfile, "\n(IR) Three address code:\n{}", three_address).expect("file write");
+    let mut labels = LabelGen::new();
+    let module = translate(&ast.data, &mut temps, &mut labels);
+    writeln!(dumpfile, "\n# (IR) linear:\n{}", module).expect("file write");
 
-    let aasm = codegen(&three_address, &mut temps);
-    writeln!(logfile, "\n(IR) Abstract assembly:\n{}", aasm).expect("file write");
+    // IR function code
+    let function_ir = ir_function::translate(&module);
+    writeln!(
+        dumpfile,
+        "\n# (IR) function with calling convention:\n{}",
+        function_ir
+    )
+    .expect("file write");
 
-    let allocations = allocate(&aasm);
-    // writeln!(logfile, "{:?}", allocations).expect("file write");
+    // CFG analysis checking
+    // Initialization and returns checks
+    if let Err(err) = analyze_cfg(&function_ir) {
+        report_diags(source, &[err.clone()]);
+        return Err(CompileError::Analysis(err));
+    }
 
-    let asm = emit_assembly(&aasm, &allocations, "main");
-    writeln!(logfile, "Emitted assembly:\n{}", asm).expect("file write");
+    // Optimization passes
+    // let linear = copy_const_prop(straightline);
+    // writeln!(
+    //     logfile,
+    //     "\n# (IR) Optimization: copy/const propagation:\n{}",
+    //     linear // )
+    // .expect("file write");
 
-    asm
+    // Emit assembly
+    let asm = emit_assembly(&function_ir, &mut labels);
+    writeln!(dumpfile, "# Emitted assembly:\n{}", asm).expect("file write");
+
+    Ok(asm)
 }
 
-pub fn run(asm: &str) -> i32 {
-    fs::write("out.s", &asm).expect("writes");
+pub fn run(source: &str) -> Result<i32, CompileError> {
+    run_with_file("<input>", source)
+}
 
-    let status = Command::new("gcc")
-        .args(["out.s", "-o", "out"])
-        .status()
-        .expect("failed to run gcc");
+pub fn run_with_file(filename: &str, source: &str) -> Result<i32, CompileError> {
+    let asm = compile_source(filename, source);
+    if let Ok(asm) = asm {
+        fs::write("out.s", &asm).expect("writes");
 
-    assert!(status.success(), "assembly failed to compile");
+        let status = Command::new("gcc")
+            .args(["out.s", "-o", "out"])
+            .status()
+            .expect("failed to run gcc");
 
-    let result = Command::new("./out").status().expect("runs");
-    result.code().unwrap_or(-1)
+        assert!(status.success(), "assembly failed to compile");
+
+        let result = Command::new("./out").status().expect("runs");
+
+        if let Some(code) = result.code() {
+            // result is truncated to 8 bits
+            println!("{}", format!("program returned {}", result).green());
+            println!("{}", format!("see dumped output in dump.txt").blue());
+            return Ok(code);
+        } else {
+            println!("{}", format!("program returned {}", result).red());
+            return Ok(-1);
+        }
+    }
+    Ok(-1)
 }
