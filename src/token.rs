@@ -1,6 +1,4 @@
 use crate::location::Located;
-use std::fmt;
-
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub enum Token {
     Plus,
@@ -8,8 +6,8 @@ pub enum Token {
     Times,
     Div,
     Mod,
-    RShift, // bit shifts not implemented
-    LShift, // bit shifts not implemented
+    RShift,
+    LShift,
     Less,
     Greater,
     NotEq,
@@ -45,7 +43,6 @@ pub enum Token {
     Semicolon,
     Question,
     Colon,
-    Comma,
 
     Struct,
     Typedef,
@@ -75,7 +72,7 @@ pub enum Token {
 
 pub type LToken = Located<Token>;
 
-pub fn string_to_keyword(s: &str) -> Option<Token> {
+pub fn sym_to_keyword(s: &str) -> Option<Token> {
     match s {
         "struct" => Some(Token::Struct),
         "typedef" => Some(Token::Typedef),
@@ -101,9 +98,9 @@ pub fn string_to_keyword(s: &str) -> Option<Token> {
     }
 }
 
-impl fmt::Display for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
+impl Token {
+    pub fn show(&self) -> String {
+        match self {
             Token::Plus => "+".to_string(),
             Token::Minus => "-".to_string(),
             Token::Times => "*".to_string(),
@@ -128,7 +125,6 @@ impl fmt::Display for Token {
             Token::LBrace => "{".to_string(),
             Token::RBrace => "}".to_string(),
             Token::Semicolon => ";".to_string(),
-            Token::Comma => ",".to_string(),
 
             Token::Struct => "struct".to_string(),
             Token::Typedef => "typedef".to_string(),
@@ -152,7 +148,7 @@ impl fmt::Display for Token {
             Token::String => "string".to_string(),
             Token::DoubleMinus => "--".to_string(),
 
-            Token::Ident(sym) => sym.clone(),
+            Token::Ident(sym) => format!("{}", &sym),
             Token::Num(n) => n.to_string(),
 
             Token::Eof => "EOF".to_string(),
@@ -172,8 +168,6 @@ impl fmt::Display for Token {
             Token::Question => "?".to_string(),
             Token::Colon => ":".to_string(),
             Token::DoublePlus => "++".to_string(),
-        };
-
-        write!(f, "{}", s)
+        }
     }
 }

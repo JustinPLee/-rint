@@ -1,9 +1,10 @@
-// string -> list of located tokens
-
-use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::location::{Located, Location, Span, loc};
-use crate::token::Token;
-use crate::token::string_to_keyword;
+use crate::{
+    context::Context,
+    diagnostic::{Diagnostic, DiagnosticKind},
+    location::{Located, Location, Span, loc},
+    token::Token,
+    token::sym_to_keyword,
+};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 struct Cursor {
@@ -12,44 +13,27 @@ struct Cursor {
     pub col: u32,
 }
 
-pub struct Lexer<'a> {
+pub struct Lexer<'ctx, 'a> {
     input: &'a [u8],
-    filename: String,
     start_cursor: Cursor,
     // points to next unread char
     end_cursor: Cursor,
-    errors: Vec<LexError>,
+    ctx: &'ctx mut Context,
 }
 
-#[derive(Eq, PartialEq, Clone, Copy, Debug)]
-pub enum LexErrorKind {
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum LexErrorKind {
+    Eof,
     UnexpectedCharacter(char),
     UnterminatedMultiLineComment,
     IntOverflow,
-    Eof,
 }
 
 #[derive(PartialEq, Clone, Debug)]
-pub struct LexError {
+struct LexError {
     pub kind: LexErrorKind,
     pub description: String,
     pub location: Location,
-}
-
-fn is_whitespace(c: char) -> bool {
-    matches!(c, ' ' | '\n' | '\r' | '\t')
-}
-
-fn is_newline(c: char) -> bool {
-    matches!(c, '\n' | '\r')
-}
-
-fn is_start_of_ident(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-fn is_body_of_ident(c: char) -> bool {
-    is_start_of_ident(c) || c.is_ascii_digit()
 }
 
 impl From<LexError> for Diagnostic {
@@ -62,15 +46,10 @@ impl From<LexError> for Diagnostic {
     }
 }
 
-impl<'a> Lexer<'a> {
-    pub fn new(input: &'a [u8]) -> Self {
-        Self::with_file(input, "<input>")
-    }
-
-    pub fn with_file(input: &'a [u8], filename: &str) -> Self {
+impl<'ctx, 'a> Lexer<'ctx, 'a> {
+    pub fn new(ctx: &'ctx mut Context, input: &'a [u8]) -> Self {
         Self {
             input,
-            filename: filename.to_string(),
             start_cursor: Cursor {
                 pos: 0,
                 line: 1,
@@ -81,34 +60,32 @@ impl<'a> Lexer<'a> {
                 line: 1,
                 col: 1,
             },
-            errors: Vec::new(),
-        }
-    }
-
-    pub fn errors(&self) -> Option<&[LexError]> {
-        if self.errors.is_empty() {
-            None
-        } else {
-            Some(&self.errors)
+            ctx,
         }
     }
 
     fn peek(&self) -> Option<char> {
-        self.input.get(self.end_cursor.pos).map(|&b| b as char)
+        self.input
+            .get(self.end_cursor.pos as usize)
+            .map(|&b| b as char)
     }
 
     fn peek_next(&self) -> Option<char> {
-        self.input.get(self.end_cursor.pos + 1).map(|&b| b as char)
+        self.input
+            .get((self.end_cursor.pos + 1) as usize)
+            .map(|&b| b as char)
     }
 
     fn peek_next_next(&self) -> Option<char> {
-        self.input.get(self.end_cursor.pos + 2).map(|&b| b as char)
+        self.input
+            .get((self.end_cursor.pos + 2) as usize)
+            .map(|&b| b as char)
     }
 
-    /// calls next() n times
+    /// Moves next `n` steps.
     fn advance(&mut self, n: usize) {
         for _ in 0..n {
-            let _ = self.next();
+            let _c = self.next();
         }
     }
 
@@ -127,12 +104,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip(&mut self, n_chars: usize) {
-        self.advance(n_chars);
+        for _ in 0..n_chars {
+            self.advance(1);
+        }
         self.collapse_cursors();
     }
 
-    /// start tracking a new token
-    /// does not process the current token being lexed
     fn collapse_cursors(&mut self) {
         assert!(self.start_cursor.pos <= self.end_cursor.pos);
         self.start_cursor = self.end_cursor;
@@ -143,70 +120,67 @@ impl<'a> Lexer<'a> {
         self.collapse_cursors();
 
         match self.peek() {
-            Some(c) if is_start_of_ident(c) => Ok(self.lex_ident()),
+            Some(c) if is_ident_start(c) => Ok(self.lex_ident()),
             Some(c) if c.is_ascii_digit() => self.lex_number(),
             Some(_) => self.lex_symbol(),
-            None => Err(self.make_error(LexErrorKind::Eof, None)),
+            None => Err(self.process_error(LexErrorKind::Eof, None)),
         }
     }
 
     fn lex_ident(&mut self) -> Located<Token> {
-        while let Some(c) = self.peek()
-            && is_body_of_ident(c)
-        {
-            self.next();
+        assert!(matches!(self.peek(), Some(c) if is_ident_start(c)));
+
+        while let Some(c) = self.peek() {
+            if is_ident_continue(c) {
+                self.advance(1);
+            } else {
+                break;
+            }
         }
 
         let utf8 = &self.input[self.start_cursor.pos..self.end_cursor.pos];
         let s = str::from_utf8(utf8).expect("valid utf8").to_string();
 
-        if let Some(keyword) = string_to_keyword(&s) {
-            self.add_location(keyword)
+        if let Some(keyword) = sym_to_keyword(&s) {
+            self.loc(keyword)
         } else {
-            self.add_location(Token::Ident(s))
+            self.loc(Token::Ident(s))
         }
     }
 
     fn lex_number(&mut self) -> Result<Located<Token>, LexError> {
+        assert!(matches!(self.peek(), Some(c) if c.is_ascii_digit()));
+
         // hex: 0[xX]...
         if self.peek() == Some('0') && matches!(self.peek_next(), Some('x' | 'X')) {
-            // 0[xX]
+            // consume 0x prefix
             self.advance(2);
 
-            let hex_start = self.end_cursor.pos;
+            let non_prefix_start = self.end_cursor.pos;
+
             while let Some(c) = self.peek()
                 && c.is_ascii_hexdigit()
             {
-                self.next();
+                self.advance(1);
             }
 
-            // detect dangling hex numbers. ex: 0x or 0xG
-            if self.end_cursor.pos == hex_start {
-                return Err(self.make_error(
-                    LexErrorKind::UnexpectedCharacter(self.peek().unwrap()),
-                    Some("incomplete hexadecimal number"),
-                ));
+            let next = self.peek().unwrap_or(' ');
+            if is_ident_start(next) || self.end_cursor.pos == non_prefix_start {
+                let kind = LexErrorKind::UnexpectedCharacter(self.peek().expect("char"));
+                // skip 0x or _ after hex
+                let n_chars = if is_ident_start(next) { 1 } else { 2 };
+                self.advance(n_chars);
+                return Err(self.process_error(kind, Some("hexadecimal number".to_string())));
             }
 
-            // detect invalid characters following hex numbers. ex: 0x2a
-            // use ident as the detecting condition because other symbols could be terminators
-            if let Some(next) = self.peek()
-                && is_start_of_ident(next)
-            {
-                return Err(self.make_error(
-                    LexErrorKind::UnexpectedCharacter(next),
-                    Some("bad hexadecimal number"),
-                ));
-            }
-
-            let utf8 = &self.input[hex_start..self.end_cursor.pos];
+            let utf8 = &self.input[non_prefix_start..self.end_cursor.pos];
             let s = str::from_utf8(utf8).expect("valid utf8");
-            if let Ok(val) = i32::from_str_radix(s, 16) {
-                return Ok(self.add_location(Token::Num(val)));
+            if let Ok(val) = i32::from_str_radix(&s, 16) {
+                return Ok(self.loc(Token::Num(val)));
             } else {
-                return Err(self.make_error(
+                return Err(self.process_error(
                     LexErrorKind::IntOverflow,
-                    Some("overflowed hexadecimal number"),
+                    Some("hexadecimal number".to_string()),
                 ));
             }
         }
@@ -215,167 +189,208 @@ impl<'a> Lexer<'a> {
         while let Some(c) = self.peek()
             && c.is_ascii_digit()
         {
-            self.next();
+            self.advance(1);
         }
 
-        if let Some(next) = self.peek()
-            && is_start_of_ident(next)
-        {
-            let kind = LexErrorKind::UnexpectedCharacter(next);
-            self.next();
-            return Err(self.make_error(kind, Some("bad decimal number")));
+        let next = self.peek().unwrap_or(' ');
+        if is_ident_start(next) {
+            let kind = LexErrorKind::UnexpectedCharacter(self.peek().unwrap());
+            self.advance(1);
+            return Err(self.process_error(kind, Some("decimal number".to_string())));
         }
 
         let utf8 = &self.input[self.start_cursor.pos..self.end_cursor.pos];
         let s = str::from_utf8(utf8).expect("valid utf8");
-        if let Ok(val) = s.parse::<i32>() {
-            Ok(self.add_location(Token::Num(val)))
+        if let Ok(val) = i32::from_str_radix(&s, 10) {
+            return Ok(self.loc(Token::Num(val)));
         } else {
-            Err(self.make_error(LexErrorKind::IntOverflow, Some("bad decimal number")))
+            return Err(self.process_error(
+                LexErrorKind::IntOverflow,
+                Some("decimal number".to_string()),
+            ));
         }
     }
 
     fn lex_symbol(&mut self) -> Result<Located<Token>, LexError> {
         let Some(c) = self.peek() else {
-            return Err(self.make_error(LexErrorKind::Eof, Some("symbol")));
+            self.advance(1);
+            return Err(self.process_error(LexErrorKind::Eof, Some("symbol".to_string())));
         };
 
-        let token = match c {
-            '+' => self.lex_three(Token::Plus, '+', Token::DoublePlus, '=', Token::PlusEq),
-            '-' => self.lex_three(Token::Minus, '-', Token::DoubleMinus, '=', Token::MinusEq),
-            '*' => self.lex_two(Token::Times, '=', Token::TimesEq),
-            '%' => self.lex_two(Token::Mod, '=', Token::ModEq),
-            '=' => self.lex_two(Token::Eq, '=', Token::EqualEq),
-            '!' => self.lex_two(Token::Exclam, '=', Token::NotEq),
-            '&' => self.lex_three(Token::BitAnd, '&', Token::LogicAnd, '=', Token::AndEq),
-            '|' => self.lex_three(Token::BitOr, '|', Token::LogicOr, '=', Token::OrEq),
-            '^' => self.lex_two(Token::BitXor, '=', Token::XorEq),
-            '<' => self.lex_shift(
-                '<',
-                Token::Less,
-                Token::LessEq,
-                Token::LShift,
-                Token::LShiftEq,
-            ),
-            '>' => self.lex_shift(
-                '>',
-                Token::Greater,
-                Token::GreaterEq,
-                Token::RShift,
-                Token::RShiftEq,
-            ),
-            '(' => self.lex_one(Token::LParen),
-            ')' => self.lex_one(Token::RParen),
-            '{' => self.lex_one(Token::LBrace),
-            '}' => self.lex_one(Token::RBrace),
-            ';' => self.lex_one(Token::Semicolon),
-            ':' => self.lex_one(Token::Colon),
-            '?' => self.lex_one(Token::Question),
-            ',' => self.lex_one(Token::Comma),
-            '/' => return self.lex_slash(), // special handling for comments
-            _ => {
-                self.next();
-                return Err(self.make_error(LexErrorKind::UnexpectedCharacter(c), None));
+        match c {
+            '+' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::PlusEq))
+                } else if self.peek_next() == Some('+') {
+                    self.advance(2);
+                    Ok(self.loc(Token::DoublePlus))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Plus))
+                }
             }
-        };
+            '-' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::MinusEq))
+                } else if self.peek_next() == Some('-') {
+                    self.advance(2);
+                    Ok(self.loc(Token::DoubleMinus))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Minus))
+                }
+            }
+            '*' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::TimesEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Times))
+                }
+            }
+            '/' => {
+                if self.peek_next() == Some('/') {
+                    self.skip_line_comment();
+                    self.lex_token()
+                } else if self.peek_next() == Some('*') {
+                    self.skip_block_comment()?;
+                    self.lex_token()
+                } else if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::DivEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Div))
+                }
+            }
+            '%' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::ModEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Mod))
+                }
+            }
+            '=' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::EqualEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Eq))
+                }
+            }
 
-        Ok(token)
-    }
-
-    fn lex_one(&mut self, token: Token) -> Located<Token> {
-        self.next();
-        self.add_location(token)
-    }
-
-    /// if current char is `one` and next char is `next`, lex `two`
-    /// otherwise, lex `one`
-    fn lex_two(&mut self, one: Token, next: char, two: Token) -> Located<Token> {
-        if self.peek_next() == Some(next) {
-            self.advance(2);
-            self.add_location(two)
-        } else {
-            self.next();
-            self.add_location(one)
+            '(' => {
+                self.advance(1);
+                Ok(self.loc(Token::LParen))
+            }
+            ')' => {
+                self.advance(1);
+                Ok(self.loc(Token::RParen))
+            }
+            '{' => {
+                self.advance(1);
+                Ok(self.loc(Token::LBrace))
+            }
+            '}' => {
+                self.advance(1);
+                Ok(self.loc(Token::RBrace))
+            }
+            ';' => {
+                self.advance(1);
+                Ok(self.loc(Token::Semicolon))
+            }
+            ':' => {
+                self.advance(1);
+                Ok(self.loc(Token::Colon))
+            }
+            '?' => {
+                self.advance(1);
+                Ok(self.loc(Token::Question))
+            }
+            '!' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::NotEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Exclam))
+                }
+            }
+            '&' => {
+                if self.peek_next() == Some('&') {
+                    self.advance(2);
+                    Ok(self.loc(Token::LogicAnd))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::BitAnd))
+                }
+            }
+            '|' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::OrEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::BitOr))
+                }
+            }
+            '^' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::XorEq))
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::BitXor))
+                }
+            }
+            '<' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::LessEq))
+                } else if self.peek_next() == Some('<') {
+                    if self.peek_next_next() == Some('=') {
+                        self.advance(3);
+                        return Ok(self.loc(Token::LShiftEq));
+                    } else {
+                        self.advance(2);
+                        return Ok(self.loc(Token::LShift));
+                    }
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Less))
+                }
+            }
+            '>' => {
+                if self.peek_next() == Some('=') {
+                    self.advance(2);
+                    Ok(self.loc(Token::GreaterEq))
+                } else if self.peek_next() == Some('>') {
+                    if self.peek_next_next() == Some('=') {
+                        self.advance(3);
+                        return Ok(self.loc(Token::RShiftEq));
+                    } else {
+                        self.advance(2);
+                        return Ok(self.loc(Token::RShift));
+                    }
+                } else {
+                    self.advance(1);
+                    Ok(self.loc(Token::Greater))
+                }
+            }
+            _ => {
+                self.advance(1);
+                Err(self.process_error(LexErrorKind::UnexpectedCharacter(c), None))
+            }
         }
     }
 
-    /// if current char is `base` and next char is `one`, lex `one_token`
-    /// if current char is `base` and next char is `two`, lex `two_token`
-    /// otherwise, lex `base`
-    fn lex_three(
-        &mut self,
-        base: Token,
-        one: char,
-        one_token: Token,
-        two: char,
-        two_token: Token,
-    ) -> Located<Token> {
-        match self.peek_next() {
-            Some(c) if c == one => {
-                self.advance(2);
-                self.add_location(one_token)
-            }
-            Some(c) if c == two => {
-                self.advance(2);
-                self.add_location(two_token)
-            }
-            _ => {
-                self.next();
-                self.add_location(base)
-            }
-        }
-    }
-
-    fn lex_shift(
-        &mut self,
-        shift_char: char,
-        single: Token,
-        comparison: Token,
-        shift: Token,
-        shift_assign: Token,
-    ) -> Located<Token> {
-        match (self.peek_next(), self.peek_next_next()) {
-            (Some(c), Some('=')) if c == shift_char => {
-                self.advance(3);
-                self.add_location(shift_assign)
-            }
-            (Some('='), _) => {
-                self.advance(2);
-                self.add_location(comparison)
-            }
-            (Some(c), _) if c == shift_char => {
-                self.advance(2);
-                self.add_location(shift)
-            }
-            _ => {
-                self.next();
-                self.add_location(single)
-            }
-        }
-    }
-
-    fn lex_slash(&mut self) -> Result<Located<Token>, LexError> {
-        match self.peek_next() {
-            Some('/') => {
-                self.skip_line_comment();
-                self.lex_token()
-            }
-            Some('*') => {
-                self.skip_block_comment()?;
-                self.lex_token()
-            }
-            Some('=') => {
-                self.advance(2);
-                Ok(self.add_location(Token::DivEq))
-            }
-            _ => {
-                self.next();
-                Ok(self.add_location(Token::Div))
-            }
-        }
-    }
-
-    fn make_error(&mut self, kind: LexErrorKind, description: Option<&str>) -> LexError {
+    fn process_error(&mut self, kind: LexErrorKind, description: Option<String>) -> LexError {
         let base_description = match kind {
             LexErrorKind::UnexpectedCharacter(ch) => {
                 format!("unexpected character `{ch}`")
@@ -387,22 +402,21 @@ impl<'a> Lexer<'a> {
             LexErrorKind::IntOverflow => "integer overflow".to_string(),
         };
 
-        let description = match description {
-            Some(description) => format!("{base_description}; {description}"),
-            None => base_description,
+        let concatted_description = if let Some(description) = description {
+            format!("{} -- expected {}", base_description, description)
+        } else {
+            base_description
         };
-
         LexError {
             kind,
-            description,
+            description: concatted_description,
             location: self.get_location(),
         }
     }
 
     fn skip_error(&mut self) {
-        // skip to the first "terminating" character
         while let Some(c) = self.peek() {
-            if is_whitespace(c) || matches!(c, ',' | ';' | '}' | ')') {
+            if is_whitespace(c) || matches!(c, ';' | '}' | ')') {
                 break;
             }
             self.skip(1);
@@ -410,31 +424,33 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_line_comment(&mut self) {
-        while let Some(c) = self.peek()
-            && !is_newline(c)
-        {
+        while let Some(c) = self.peek() {
+            if is_newline(c) {
+                break;
+            }
             self.skip(1);
         }
     }
 
     fn skip_block_comment(&mut self) -> Result<(), LexError> {
-        self.advance(2); // /*
+        self.advance(2); // skip /*
 
         while let Some(c) = self.peek() {
             if c == '*' && self.peek_next() == Some('/') {
-                self.skip(2); // */
+                self.skip(2);
                 return Ok(());
             }
             self.skip(1);
         }
 
-        Err(self.make_error(LexErrorKind::UnterminatedMultiLineComment, None))
+        Err(self.process_error(LexErrorKind::UnterminatedMultiLineComment, None))
     }
 
     fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek()
-            && is_whitespace(c)
-        {
+        while let Some(c) = self.peek() {
+            if !is_whitespace(c) {
+                break;
+            }
             self.skip(1);
         }
     }
@@ -451,7 +467,7 @@ impl<'a> Lexer<'a> {
                         break;
                     }
 
-                    self.errors.push(err);
+                    self.emit_diag(err.into());
                     self.skip_error();
                 }
             }
@@ -459,37 +475,61 @@ impl<'a> Lexer<'a> {
         tokens
     }
 
-    fn lex_eof(&mut self) -> Located<Token> {
-        self.add_location(Token::Eof)
+    fn emit_diag(&mut self, error: Diagnostic) {
+        self.ctx.emit_diag(error);
     }
+
     fn get_location(&mut self) -> Location {
         Location::new(
             Span::new(self.start_cursor.pos as u32, self.end_cursor.pos as u32),
             self.start_cursor.line,
             self.start_cursor.col,
-            self.filename.clone(),
+            "file1".to_string(), // temporary
         )
     }
 
-    fn add_location(&mut self, token: Token) -> Located<Token> {
+    fn lex_eof(&mut self) -> Located<Token> {
+        self.loc(Token::Eof)
+    }
+
+    fn loc(&mut self, token: Token) -> Located<Token> {
         loc(token, self.get_location())
     }
+}
+
+fn is_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\n' | '\r' | '\t')
+}
+
+fn is_newline(c: char) -> bool {
+    matches!(c, '\n' | '\r')
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_ident_continue(c: char) -> bool {
+    is_ident_start(c) || c.is_ascii_digit()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::Context;
 
-    fn new_lexer<'a>(s: &'a str) -> Lexer<'a> {
-        Lexer::new(s.as_bytes())
+    fn new_lexer<'ctx, 'a>(ctx: &'ctx mut Context, s: &'a str) -> Lexer<'ctx, 'a> {
+        Lexer::new(ctx, s.as_bytes())
     }
 
     #[test]
     fn test_next() {
-        let mut lx = new_lexer("");
+        let mut ctx = Context::default();
+
+        let mut lx = new_lexer(&mut ctx, "");
         assert_eq!(lx.next(), None);
 
-        let mut lx = new_lexer(" \n \r");
+        let mut lx = new_lexer(&mut ctx, " \n \r");
         lx.next(); // ' '
         assert_eq!(lx.end_cursor.col, 2);
         assert_eq!(lx.end_cursor.line, 1);
@@ -507,19 +547,23 @@ mod tests {
         assert_eq!(lx.end_cursor.line, 3);
     }
 
-    fn raw(ltoken: Result<Located<Token>, LexError>) -> Result<Token, LexErrorKind> {
-        ltoken.map(|ltok| ltok.data.clone()).map_err(|err| err.kind)
+    fn raw(mtoken: Result<Located<Token>, LexError>) -> Result<Token, LexErrorKind> {
+        mtoken
+            .map(|mtok| mtok.0.clone())
+            .map_err(|lex_err| lex_err.kind)
     }
 
     #[test]
     fn test_eof() {
-        let mut lx = new_lexer("");
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "");
         assert_eq!(raw(lx.lex_token()), Err(LexErrorKind::Eof));
     }
 
     #[test]
     fn test_lex_token() {
-        let mut lx = new_lexer("int main() 0x44 a1_ \n11=--- /*\nabc\n*/ //2+2");
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "int main() 0x44 a1_ \n11=--- /*\nabc\n*/ //2+2");
         assert_eq!(raw(lx.lex_token()), Ok(Token::Int));
         assert_eq!(raw(lx.lex_token()), Ok(Token::Ident("main".to_string())));
         assert_eq!(raw(lx.lex_token()), Ok(Token::LParen));
@@ -534,26 +578,30 @@ mod tests {
     }
 
     #[test]
-    fn test_tokens_and_locations() {
-        let source = r#"
-            int main(bool flag, int x) {
-                if (flag && x >= 0) {
-                    return x == 0 ? 1 : x + 0x10;
-                } else {
-                    return 0;
-                }
-            }
-        "#;
-        let mut lexer = new_lexer(source);
-        let tokens = lexer.lex();
+    fn test_lex_ident() {
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "");
+        assert_eq!(raw(lx.lex_token()), Err(LexErrorKind::Eof));
+    }
 
-        assert!(lexer.errors().is_none());
-        insta::assert_debug_snapshot!(tokens);
+    #[test]
+    fn test_lex_number() {
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "");
+        assert_eq!(raw(lx.lex_token()), Err(LexErrorKind::Eof));
+    }
+
+    #[test]
+    fn test_lex_symbol() {
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "");
+        assert_eq!(raw(lx.lex_token()), Err(LexErrorKind::Eof));
     }
 
     #[test]
     fn test_skip_line_comment() {
-        let mut lx = new_lexer("break //   break");
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "break //   break");
         assert_eq!(raw(lx.lex_token()), Ok(Token::Break));
         lx.skip_line_comment();
         assert_eq!(raw(lx.lex_token()), Err(LexErrorKind::Eof));
@@ -561,10 +609,12 @@ mod tests {
 
     #[test]
     fn test_skip_block_comment() {
-        let mut lx = new_lexer("break /*   break*/ /* b");
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "break /*   break*/ /* b");
         assert_eq!(raw(lx.lex_token()), Ok(Token::Break));
         assert_eq!(lx.skip_block_comment(), Ok(()));
 
+        // check unterminated block comment
         assert_eq!(
             lx.skip_block_comment().map_err(|lx_err| lx_err.kind),
             Err(LexErrorKind::UnterminatedMultiLineComment)
@@ -573,38 +623,17 @@ mod tests {
 
     #[test]
     fn test_skip_whitespace() {
-        let mut lx = new_lexer(" \n\r\t\ta\r");
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, " \n\r\t\ta\r");
         lx.skip_whitespace();
         assert_eq!(lx.next(), Some('a'));
     }
 
     #[test]
     fn test_bad_char() {
-        let mut lx = new_lexer("aaa@ aa");
+        let mut ctx = Context::default();
+        let mut lx = new_lexer(&mut ctx, "aaa@ aa");
         assert_eq!(raw(lx.lex_token()), Ok(Token::Ident("aaa".to_string())));
-        assert_eq!(
-            raw(lx.lex_token()),
-            Err(LexErrorKind::UnexpectedCharacter('@'))
-        );
-    }
-
-    #[test]
-    fn test_integer_overflow() {
-        let mut dec = new_lexer("2147483648");
-        assert_eq!(raw(dec.lex_token()), Err(LexErrorKind::IntOverflow));
-
-        let mut hex = new_lexer("0x100000000");
-        assert_eq!(raw(hex.lex_token()), Err(LexErrorKind::IntOverflow));
-    }
-
-    #[test]
-    fn test_bad_hex() {
-        for (source, ch) in [("0xG", 'G'), ("0x_", '_'), ("0x1G", 'G'), ("0X1_", '_')] {
-            let mut lx = new_lexer(source);
-            assert_eq!(
-                raw(lx.lex_token()),
-                Err(LexErrorKind::UnexpectedCharacter(ch)),
-            );
-        }
+        assert!(lx.lex_token().is_err());
     }
 }

@@ -1,0 +1,15 @@
+---
+source: src/parser.rs
+expression: "(format!(\"{}={}\", s, expected), expr)"
+---
+- 10/(1*2)=5
+- Binary:
+    - Num:
+        Dec: "10"
+    - Div
+    - Binary:
+        - Num:
+            Dec: "1"
+        - Star
+        - Num:
+            Dec: "2"

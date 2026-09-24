@@ -1,35 +1,26 @@
 use crate::location::Located;
-use crate::utils::{Pretty, write_indent};
-use std::fmt::Write;
+use std::fmt;
 
-pub use crate::ast_parse::BinOp;
-
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub enum Typ {
-    Int,
-    Bool,
-    Void,
-    Named(String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Param {
-    pub typ: LTyp,
-    pub name: LIdent,
-}
-
-#[derive(Clone, Debug)]
-pub enum GlobalDecl {
-    Typedef {
-        typ: LTyp,
-        alias: LIdent,
-    },
-    FunDef {
-        ret_typ: LTyp,
-        name: LIdent,
-        params: Vec<LParam>,
-        body: Option<LBlock>, // if none, then this is a function declaration
-    },
+#[derive(Clone, Debug, PartialEq)]
+pub enum BinOp {
+    Plus,
+    Minus,
+    Times,
+    Div,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
+    Greater,
+    GreaterEq,
+    Less,
+    LessEq,
+    EqualEq,
+    NotEq,
+    LogicAnd,
+    LogicOr,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,7 +30,7 @@ pub enum Expr {
     True,
     False,
     BinOp {
-        op: LBinOp,
+        op: BinOp,
         lhs: Box<LExpr>,
         rhs: Box<LExpr>,
     },
@@ -48,268 +39,195 @@ pub enum Expr {
         true_expr: Box<LExpr>,
         false_expr: Box<LExpr>,
     },
-    FunCall {
-        name: LIdent,
-        args: Vec<Box<LExpr>>,
+}
+
+pub type LExpr = Located<Expr>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Typ {
+    Int,
+    Bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Decl {
+    Decl {
+        typ: Typ,
+        name: String,
+    },
+    Init {
+        typ: Typ,
+        name: String,
+        value: LExpr,
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     Assign {
-        name: LIdent,
+        name: String,
         value: LExpr,
     },
     If {
         cond: LExpr,
-        true_block: LBlock,
-        false_block: Option<LBlock>,
+        false_stmt: Box<LStmt>,
+        true_stmt: Box<LStmt>,
     },
     While {
         cond: LExpr,
-        body: LBlock,
+        body: Box<LStmt>,
     },
-    // while cannot be fully lowered in for loops due to continue statements
-    // a while loop's continue jumps to the condition label
-    // but a for loops continue has to execute the step statement first before jumping
-    // TODO: try to find a cleaner solution?
-    For {
-        init: Option<Box<LStmt>>,
-        cond: LExpr,
-        step: Option<Box<LStmt>>,
-        body: LBlock,
-    },
-    Return(Option<LExpr>),
-    // variables are statically scoped at their declaration
+    Return(LExpr),
+    // this follows the specification
+    // this way, variable scopes are clear
     Decl {
-        typ: LTyp,
-        name: LIdent,
-        block: LBlock,
+        typ: Typ,
+        name: String,
+        rest: Vec<LStmt>,
     },
-    Expr(LExpr),
-    Assert(LExpr),
-    Block(LBlock),
-    Break,
-    Continue,
+    StmtExpr(LExpr),
+    Seq(Vec<LStmt>),
 }
-
-#[derive(Clone, Debug)]
-pub struct Block(pub Vec<LStmt>);
-
-#[derive(Clone, Debug)]
-pub struct Program(pub Vec<LGlobalDecl>);
 
 pub type LStmt = Located<Stmt>;
-pub type LIdent = Located<String>;
-pub type LTyp = Located<Typ>;
-pub type LBinOp = Located<BinOp>;
-pub type LExpr = Located<Expr>;
-pub type LBlock = Located<Block>;
-pub type LParam = Located<Param>;
-pub type LGlobalDecl = Located<GlobalDecl>;
-pub type LProgram = Located<Program>;
 
-impl Pretty for Block {
-    fn pretty(&self, indent: usize) -> String {
-        let mut s = String::new();
-        s.push_str("(block");
-        for stmt in &self.0 {
-            s.push('\n');
-            write_indent(&mut s, indent + 1).unwrap();
-            write!(s, "{}", stmt.data.pretty(indent + 1)).unwrap();
+pub struct Program(pub Vec<LStmt>);
+
+impl fmt::Display for Program {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "(program ");
+        for lstmt in &self.0 {
+            writeln!(f, "{}", lstmt.0);
         }
-        s.push('\n');
-        write_indent(&mut s, indent).unwrap();
-        s.push_str(")");
-        s
+        writeln!(f, ")")
     }
 }
 
-impl Pretty for Typ {
-    fn pretty(&self, _indent: usize) -> String {
+impl fmt::Display for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let op = match self {
+            BinOp::Plus => "+",
+            BinOp::Minus => "-",
+            BinOp::Times => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::LShift => "<<",
+            BinOp::RShift => ">>",
+            BinOp::Greater => ">",
+            BinOp::GreaterEq => ">=",
+            BinOp::Less => "<",
+            BinOp::LessEq => "<=",
+            BinOp::EqualEq => "==",
+            BinOp::NotEq => "!=",
+            BinOp::LogicAnd => "&&",
+            BinOp::LogicOr => "||",
+        };
+        write!(f, "{op}")
+    }
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Typ::Int => "int".to_string(),
-            Typ::Bool => "bool".to_string(),
-            Typ::Void => "void".to_string(),
-            Typ::Named(typ) => typ.to_string(),
-        }
-    }
-}
-impl Pretty for Stmt {
-    fn pretty(&self, indent: usize) -> String {
-        match self {
-            Stmt::Assign { name, value } => {
-                format!("(assign {} {})", name, value.data.pretty(indent))
-            }
-            Stmt::If {
-                cond,
-                true_block,
-                false_block,
-            } => {
-                let mut s = String::new();
-                writeln!(s, "(if {}", cond.data.pretty(indent)).unwrap();
-                write_indent(&mut s, indent + 1).unwrap();
-                write!(s, "then {}", true_block.pretty(indent + 1)).unwrap();
-                if let Some(false_block) = false_block {
-                    s.push('\n');
-                    write_indent(&mut s, indent + 1).unwrap();
-                    write!(s, "else {}", false_block.pretty(indent + 1)).unwrap();
-                }
-                s.push_str(")");
-                s
-            }
-            Stmt::While { cond, body } => {
-                let mut s = String::new();
-                writeln!(s, "(while {}", cond.data.pretty(indent)).unwrap();
-                write_indent(&mut s, indent + 1).unwrap();
-                write!(s, "{}", body.pretty(indent + 2)).unwrap();
-                s
-            }
-            Stmt::For {
-                init,
-                cond,
-                step,
-                body,
-            } => {
-                let init = init
-                    .as_ref()
-                    .map(|stmt| stmt.data.pretty(indent))
-                    .unwrap_or_default();
-                let step = step
-                    .as_ref()
-                    .map(|stmt| stmt.data.pretty(indent))
-                    .unwrap_or_default();
-                let mut s = String::new();
-                writeln!(s, "(for ({init}; {}; {step})", cond.data.pretty(indent)).unwrap();
-                write_indent(&mut s, indent + 1).unwrap();
-                write!(s, "{}", body.pretty(indent + 2)).unwrap();
-                s
-            }
-            Stmt::Return(expr) => {
-                if let Some(expr) = expr {
-                    format!("(return {})", expr.data.pretty(indent))
-                } else {
-                    "(return)".to_string()
-                }
-            }
-            Stmt::Decl { typ, name, block } => {
-                let mut s = String::new();
-                writeln!(s, "(declare {} {}", name, typ.pretty(indent)).unwrap();
-                write_indent(&mut s, indent + 1).unwrap();
-                write!(s, "{})", block.pretty(indent + 1)).unwrap();
-                s
-            }
-            Stmt::Expr(expr) => expr.data.pretty(indent),
-            Stmt::Block(block) => block.pretty(indent),
-            Stmt::Break => "(break)".to_string(),
-            Stmt::Continue => "(continue)".to_string(),
-            Stmt::Assert(expr) => format!("(assert {})", expr.data.pretty(indent)),
-        }
-    }
-}
+            Expr::Ident(name) => write!(f, "{name}"),
 
-impl Pretty for GlobalDecl {
-    fn pretty(&self, indent: usize) -> String {
-        match self {
-            GlobalDecl::Typedef { typ, alias } => {
-                format!("(typedef {} {})", typ.pretty(indent), alias)
-            }
-            GlobalDecl::FunDef {
-                ret_typ,
-                name,
-                params,
-                body,
-            } => {
-                let mut s = String::new();
-                write!(s, "(fun_def {} {} [", ret_typ.pretty(indent), name).unwrap();
-                for (i, param) in params.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str(", ");
-                    }
-                    write!(s, "{}", param.pretty(indent)).unwrap();
-                }
-                s.push_str("]");
-                if let Some(body) = body {
-                    s.push('\n');
-                    write_indent(&mut s, indent + 1).unwrap();
-                    write!(s, "{}", body.pretty(indent + 1)).unwrap();
-                }
-                s.push_str(")");
-                s
-            }
-        }
-    }
-}
+            Expr::Int(value) => write!(f, "{value}"),
 
-impl Pretty for Param {
-    fn pretty(&self, _indent: usize) -> String {
-        format!("{} {}", self.typ.pretty(0), self.name)
-    }
-}
+            Expr::True => write!(f, "true"),
 
-impl Pretty for Program {
-    fn pretty(&self, indent: usize) -> String {
-        let mut s = String::new();
-        s.push_str("(program");
-        for gdecl in &self.0 {
-            s.push('\n');
-            write_indent(&mut s, indent + 1).unwrap();
-            write!(s, "{}", gdecl.pretty(indent + 1)).unwrap();
-        }
-        s.push('\n');
-        write_indent(&mut s, indent).unwrap();
-        s.push_str(")");
-        s
-    }
-}
+            Expr::False => write!(f, "false"),
 
-impl Pretty for Expr {
-    fn pretty(&self, indent: usize) -> String {
-        match self {
-            Expr::Ident(name) => name.to_string(),
-            Expr::Int(value) => value.to_string(),
-            Expr::True => "true".to_string(),
-            Expr::False => "false".to_string(),
             Expr::BinOp { op, lhs, rhs } => {
-                let mut s = String::new();
-                write!(
-                    s,
-                    "({} {} {})",
-                    op,
-                    lhs.data.pretty(indent),
-                    rhs.data.pretty(indent)
-                )
-                .unwrap();
-                s
+                write!(f, "({op} {} {})", lhs.0, rhs.0)
             }
+
             Expr::TernOp {
                 cond,
                 true_expr,
                 false_expr,
             } => {
-                let mut s = String::new();
-                write!(
-                    s,
-                    "({} ? {} : {})",
-                    cond.data.pretty(indent),
-                    true_expr.data.pretty(indent),
-                    false_expr.data.pretty(indent)
-                )
-                .unwrap();
-                s
-            }
-
-            Expr::FunCall { name, args } => {
-                let mut s = String::new();
-                write!(s, "(call {}", name).unwrap();
-                for arg in args {
-                    write!(s, " {}", arg.data.pretty(indent)).unwrap();
-                }
-                s.push_str(")");
-                s
+                write!(f, "(?: {} {} {})", cond.0, true_expr.0, false_expr.0)
             }
         }
     }
 }
 
-crate::impl_display_from_pretty!(Block, Typ, Stmt, GlobalDecl, Param, Program, Expr);
+impl fmt::Display for Typ {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Typ::Int => write!(f, "int"),
+            Typ::Bool => write!(f, "bool"),
+        }
+    }
+}
+
+impl fmt::Display for Decl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Decl::Decl { typ, name } => {
+                write!(f, "(declare {name} {typ})")
+            }
+
+            Decl::Init { typ, name, value } => {
+                write!(f, "(declare {name} {typ} {})", value.0)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Stmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stmt::Assign { name, value } => {
+                write!(f, "(assign {name} {})", value.0)
+            }
+
+            Stmt::If {
+                cond,
+                true_stmt,
+                false_stmt,
+            } => {
+                write!(
+                    f,
+                    "(if {}\nthen {}\nelse {})",
+                    cond.0, true_stmt.0, false_stmt.0
+                )
+            }
+
+            Stmt::While { cond, body } => {
+                write!(f, "(while {}\n{})", cond.0, body.0)
+            }
+
+            Stmt::Return(expr) => {
+                write!(f, "(return {})", expr.0)
+            }
+
+            Stmt::Decl { typ, name, rest } => {
+                write!(f, "(declare {name} {typ}")?;
+
+                for stmt in rest {
+                    write!(f, "\n{}", stmt.0)?;
+                }
+
+                write!(f, ")")
+            }
+
+            Stmt::StmtExpr(expr) => {
+                write!(f, "{}", expr.0)
+            }
+
+            Stmt::Seq(stmts) => {
+                write!(f, "(seq")?;
+
+                for stmt in stmts {
+                    write!(f, "\n{}", stmt.0)?;
+                }
+
+                write!(f, ")")
+            }
+        }
+    }
+}

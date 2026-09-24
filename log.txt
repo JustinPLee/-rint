@@ -1,0 +1,157 @@
+Lexed Tokens:
+[Int, Ident("main"), LParen, RParen, LBrace, Int, Ident("y"), Eq, Num(0), Semicolon, While, LParen, Ident("y"), Less, Num(10), RParen, LBrace, Ident("y"), Eq, Ident("y"), Plus, Num(1), Semicolon, RBrace, If, LParen, Ident("y"), EqualEq, Num(20), RParen, LBrace, Return, Num(0), Semicolon, RBrace, Else, LBrace, For, LParen, Int, Ident("x"), Eq, Num(0), Semicolon, Ident("x"), Less, Num(10), Semicolon, Ident("x"), DoublePlus, RParen, LBrace, Ident("y"), MinusEq, Num(1), Semicolon, RBrace, Ident("y"), PlusEq, Num(2), Semicolon, RBrace, Return, Ident("y"), Semicolon, RBrace, Eof]
+
+CST:
+(program
+(declare y int 0)
+(while (< y 10)
+(block
+(assign y (+ y 1))))
+(if (== y 20)
+then (block
+(return 0))
+else (block
+(for (declare x int 0)(< x 10)(++ x)
+(block
+(-= y 1)))
+(+= y 2)))
+(return y)
+)
+
+AST:
+(program 
+(declare y int
+(assign y 0)
+(while (< y 10)
+(seq
+(assign y (+ y 1))))
+(if (== y 20)
+then (seq
+(return 0))
+else (seq
+(seq
+(declare x int
+(assign x 0)
+(while (< x 10)
+(seq
+(seq
+(assign y (- y 1)))
+(assign x (+ x 1))))))
+(assign y (+ y 2))))
+(return y))
+)
+
+
+(IR) Three address code:
+program:
+t0 ← 0
+jump L1
+L0:
+t0 ← (t0 + 1)
+L1:
+if t0 < 10 jump L0
+if t0 == 20 jump L2
+t1 ← 0
+jump L5
+L4:
+t0 ← (t0 - 1)
+t1 ← (t1 + 1)
+L5:
+if t1 < 10 jump L4
+t0 ← (t0 + 2)
+jump L3
+L2:
+return 0
+L3:
+return t0
+
+
+(IR) Abstract assembly:
+program:
+mov t0, 0
+goto L1
+L0:
+mov t2, t0
+mov t3, 1
+add t0, t2, t3
+L1:
+mov t4, t0
+mov t5, 10
+if t4 < t5 goto L0
+mov t6, t0
+mov t7, 20
+if t6 == t7 goto L2
+mov t1, 0
+goto L5
+L4:
+mov t8, t0
+mov t9, 1
+sub t0, t8, t9
+mov t10, t1
+mov t11, 1
+add t1, t10, t11
+L5:
+mov t12, t1
+mov t13, 10
+if t12 < t13 goto L4
+mov t14, t0
+mov t15, 2
+add t0, t14, t15
+goto L3
+L2:
+mov t-1, 0
+L3:
+mov t-1, t0
+
+Emitted assembly:
+.text
+.globl main
+.type main, @function
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    movl $0, %esi
+    jmp L1
+L0:
+    movl %esi, %ebx
+    movl $1, %ecx
+    movl %ebx, %esi
+    addl %ecx, %esi
+L1:
+    movl %esi, %ebx
+    movl $10, %ecx
+    cmpl %ecx, %ebx
+    jl L0
+    movl %esi, %ebx
+    movl $20, %ecx
+    cmpl %ecx, %ebx
+    je L2
+    movl $0, %edi
+    jmp L5
+L4:
+    movl %esi, %ebx
+    movl $1, %ecx
+    movl %ebx, %esi
+    subl %ecx, %esi
+    movl %edi, %ebx
+    movl $1, %ecx
+    movl %ebx, %edi
+    addl %ecx, %edi
+L5:
+    movl %edi, %ebx
+    movl $10, %ecx
+    cmpl %ecx, %ebx
+    jl L4
+    movl %esi, %ebx
+    movl $2, %ecx
+    movl %ebx, %esi
+    addl %ecx, %esi
+    jmp L3
+L2:
+    movl $0, %eax
+L3:
+    movl %esi, %eax
+    popq %rbp
+    ret
+.size main, .-main
+

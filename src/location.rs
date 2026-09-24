@@ -1,27 +1,15 @@
-use std::fmt;
-
-#[derive(Default, Eq, PartialOrd, Ord, PartialEq, Hash, Copy, Clone, Debug)]
+#[derive(Default, Eq, PartialOrd, Ord, PartialEq, Copy, Clone, Debug)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
 }
 
-#[derive(Eq, PartialEq, Hash, Clone, Debug, Default)]
+#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Debug, Default)]
 pub struct Location {
     pub span: Span,
     pub line: u32,
     pub col: u32,
     pub filename: String,
-}
-
-#[derive(Eq, PartialEq, Hash, Clone, Debug)]
-pub struct Located<T> {
-    pub data: T,
-    pub location: Location,
-}
-
-pub fn loc<T>(data: T, location: Location) -> Located<T> {
-    Located { data, location }
 }
 
 impl Span {
@@ -50,26 +38,22 @@ impl Location {
         }
     }
 
-    // assumes same file location
     pub fn merge(self, other: &Location) -> Self {
-        let span = self.span.merge(&other.span);
-        let start = if self.span.start <= other.span.start {
-            &self
-        } else {
-            other
-        };
-
         Self {
-            span,
-            line: start.line,
-            col: start.col,
-            filename: start.filename.clone(),
+            span: self.span.merge(&other.span),
+            line: self.line.min(other.line),
+            col: self.col,
+            filename: self.filename.clone(),
         }
     }
 }
 
-impl<T: fmt::Display> fmt::Display for Located<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.data)
-    }
+#[derive(Eq, PartialEq, PartialOrd, Ord, Clone, Debug)]
+pub struct Located<T>(pub T, pub Location);
+pub fn loc<T: Clone>(data: T, location: Location) -> Located<T> {
+    Located(data, location)
+}
+
+pub fn unloc<T: Clone>(data: &Located<T>) -> T {
+    data.0.clone()
 }
