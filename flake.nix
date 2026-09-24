@@ -15,6 +15,8 @@
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           rustup
+          just
+          gcc
           cargo-watch
           cargo-outdated
           cargo-edit

@@ -345,24 +345,27 @@ impl Cfg {
 
         while let Some(block_id) = worklist.pop_front() {
             // in[b] = intersection of out[pred]
-            let mut incoming: HashSet<Operand> = HashSet::new();
-            if block_id == self.entry {
-                incoming = params.clone();
-            } else {
-                let pred_ids: Vec<BlockId> = self.blocks[block_id]
-                    .preds
-                    .iter()
-                    .copied()
-                    .filter(|pred| reachable.contains(pred))
-                    .collect();
-
-                incoming = block_out[*pred_ids.first().expect("all blocks have pred")].clone();
-                for pred_id in pred_ids.into_iter().skip(1) {
-                    incoming = incoming
-                        .intersection(&block_out[pred_id])
-                        .into_iter()
-                        .cloned()
+            let incoming: HashSet<Operand> = {
+                if block_id == self.entry {
+                    params.clone()
+                } else {
+                    let pred_ids: Vec<BlockId> = self.blocks[block_id]
+                        .preds
+                        .iter()
+                        .copied()
+                        .filter(|pred| reachable.contains(pred))
                         .collect();
+
+                    let mut pred_outgoing =
+                        block_out[*pred_ids.first().expect("all blocks have pred")].clone();
+                    for pred_id in pred_ids.into_iter().skip(1) {
+                        pred_outgoing = pred_outgoing
+                            .intersection(&block_out[pred_id])
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                    }
+                    pred_outgoing
                 }
             };
 

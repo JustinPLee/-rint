@@ -392,11 +392,11 @@ impl Pretty for Control {
                 let mut s = String::new();
                 writeln!(s, "(if {}", cond.data.pretty(indent)).unwrap();
                 write_indent(&mut s, indent + 1).unwrap();
-                write!(s, "then {}", true_block.pretty(indent + 1)).unwrap();
+                write!(s, "(then {})", true_block.pretty(indent + 1)).unwrap();
                 if let Some(false_block) = false_block {
                     s.push('\n');
                     write_indent(&mut s, indent + 1).unwrap();
-                    write!(s, "else {}", false_block.pretty(indent + 1)).unwrap();
+                    write!(s, "(else {})", false_block.pretty(indent + 1)).unwrap();
                 }
                 s.push_str(")");
                 s

@@ -28,12 +28,13 @@ pub fn compile(source: &str) -> Result<String, CompileError> {
     compile_source("<input>", source)
 }
 
+const DUMPFILE: &str = "dump.txt";
 pub fn compile_source(filename: &str, source: &str) -> Result<String, CompileError> {
     let mut dumpfile = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open("dump.txt")
+        .open(DUMPFILE)
         .expect("file opened");
 
     writeln!(dumpfile, "# Source program:\n{}", source).expect("file write");
@@ -122,14 +123,22 @@ pub fn run_with_file(filename: &str, source: &str) -> Result<i32, CompileError> 
         assert!(status.success(), "assembly failed to compile");
 
         let result = Command::new("./out").status().expect("runs");
+        // append to dumpfile
+        let mut dumpfile = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(DUMPFILE)
+            .expect("file opened");
 
         if let Some(code) = result.code() {
             // result is truncated to 8 bits
             println!("{}", format!("program returned {}", result).green());
             println!("{}", format!("see dumped output in dump.txt").blue());
+            write!(dumpfile, "# Result:\n{}", code).expect("file write");
             return Ok(code);
         } else {
             println!("{}", format!("program returned {}", result).red());
+            write!(dumpfile, "# Result:\n Error",).expect("file write");
             return Ok(-1);
         }
     }

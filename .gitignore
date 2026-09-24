@@ -1,5 +1,4 @@
 target/
 .direnv/
-.envrc
 out
 out.s
