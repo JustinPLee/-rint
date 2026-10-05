@@ -13,11 +13,11 @@ expression: "format!(\"{}\", program)"
     (block
       (declare result Number ((&& flag (> x 0)) ? x : 0))
       (if (&& (!= result 0) (call xyz 3))
-        then (block
+        (then (block
           (return result)
-        )
-        else (block
-          (return 1)
         ))
+        (else (block
+          (return 1)
+        )))
     ))
 )

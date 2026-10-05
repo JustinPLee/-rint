@@ -1,18 +1,19 @@
 // parse ast -> ast
 
 use crate::ast::{
-    BinOp, Block, Expr, GlobalDecl, LBinOp, LBlock, LExpr, LGlobalDecl, LProgram, LStmt, LTyp,
-    Param, Program, Stmt, Typ,
+    BinOp, Block, Expr, GlobalDecl, LBinOp, LBlock, LExpr, LGlobalDecl, LLValue, LProgram, LStmt,
+    LStructField, LTyp, LValue, Param, Program, Stmt, StructField, Typ,
 };
 use crate::ast_parse::{
     AsnOp as CAsnOp, BinOp as CBinOp, Control, Decl as CDecl, Expr as CExpr,
     GlobalDecl as CGlobalDecl, LAsnOp as CLAsnOp, LBinOp as CLBinOp, LBlock as CLBlock, LControl,
     LDecl as CLDecl, LExpr as CLExpr, LGlobalDecl as CLGlobalDecl, LIdent as CLIdent,
-    LParam as CLParam, LPostOp, LProgram as CProgram, LRetTyp, LSimp, LStmt as CLStmt,
-    LTyp as CLTyp, LUnOp as CLUnOp, LValue as CLValue, PostOp as CPostOp, RetTyp as CRetTyp,
-    Simp as CSimp, Stmt as CStmt, Typ as CTyp, UnOp as CUnOp,
+    LLValue as CLLValue, LParam as CLParam, LPostOp, LProgram as CProgram, LRetTyp, LSimp,
+    LStmt as CLStmt, LStructField as CLStructField, LTyp as CLTyp, LUnOp as CLUnOp,
+    LValue as CLValue, PostOp as CPostOp, RetTyp as CRetTyp, Simp as CSimp, Stmt as CStmt,
+    Typ as CTyp, UnOp as CUnOp,
 };
-use crate::location::{Location, loc};
+use crate::location::{Located, Location, loc};
 
 // straightforward translation
 fn elaborate_expr(expr: CLExpr) -> LExpr {
@@ -23,6 +24,7 @@ fn elaborate_expr(expr: CLExpr) -> LExpr {
         CExpr::Int(i) => Expr::Int(i),
         CExpr::True => Expr::True,
         CExpr::False => Expr::False,
+        CExpr::Null => Expr::Null,
         CExpr::UnOp { op, oper } => elaborate_unop(op, *oper, location.clone()).data,
         CExpr::BinOp { op, lhs, rhs } => elaborate_binop(op, *lhs, *rhs, location.clone()).data,
         CExpr::TernOp {
@@ -37,6 +39,31 @@ fn elaborate_expr(expr: CLExpr) -> LExpr {
         CExpr::FunCall { name, args } => Expr::FunCall {
             name: loc(name.data, name.location),
             args: args.into_iter().map(elaborate_expr).map(Box::new).collect(),
+        },
+        CExpr::Field { ident, field } => Expr::Field {
+            ident: Box::new(elaborate_expr(*ident)),
+            field: loc(field.data, field.location),
+        },
+        // a->b becomes (*a).b
+        CExpr::Arrow { base, field } => {
+            let deref_location = base.location.clone();
+            Expr::Field {
+                ident: Box::new(loc(
+                    Expr::Deref(Box::new(elaborate_expr(*base))),
+                    deref_location,
+                )),
+                field: loc(field.data, field.location),
+            }
+        }
+        CExpr::Deref(expr) => Expr::Deref(Box::new(elaborate_expr(*expr))),
+        CExpr::Index { base, index } => Expr::Index {
+            base: Box::new(elaborate_expr(*base)),
+            index: Box::new(elaborate_expr(*index)),
+        },
+        CExpr::Alloc(typ) => Expr::Alloc(elaborate_typ(typ)),
+        CExpr::AllocArray { typ, size } => Expr::AllocArray {
+            typ: elaborate_typ(typ),
+            size: Box::new(elaborate_expr(*size)),
         },
     };
 
@@ -61,8 +88,7 @@ fn elaborate_binop(op: CLBinOp, lhs: CLExpr, rhs: CLExpr, location: Location) ->
 
     let op = match op.data {
         // translate && and || to ternaries
-        // a && b -> a ? b : false
-        // a || b -> a ? true : b
+        // a && b becomes a ? b : false
         CBinOp::LogicAnd => {
             return loc(
                 Expr::TernOp {
@@ -73,6 +99,7 @@ fn elaborate_binop(op: CLBinOp, lhs: CLExpr, rhs: CLExpr, location: Location) ->
                 location,
             );
         }
+        // a || b becomes a ? true : b
         CBinOp::LogicOr => {
             return loc(
                 Expr::TernOp {
@@ -109,17 +136,23 @@ fn elaborate_unop(op: CLUnOp, oper: CLExpr, location: Location) -> LExpr {
     let op_location = op.location.clone();
 
     match op.data {
-        // -x -> 0 - x
+        // -x becomes 0 - x
         CUnOp::Negate => {
             let zero = loc(Expr::Int(0), location.clone());
 
             bin(loc(BinOp::Minus, op_location), zero, oper, location)
         }
-        // !x -> x == false
+        // !x becomes x == false
         CUnOp::Exclam => {
             let false_expr = loc(Expr::False, location.clone());
 
             bin(loc(BinOp::EqualEq, op_location), oper, false_expr, location)
+        }
+        // ~x becomes x ^ -1
+        CUnOp::BitNot => {
+            let minus_one = loc(Expr::Int(-1), location.clone());
+
+            bin(loc(BinOp::BitXor, op_location), oper, minus_one, location)
         }
     }
 }
@@ -175,15 +208,13 @@ fn elaborate_decl(decl: CLDecl, rest: &[CLStmt], location: Location) -> LStmt {
         CDecl::Init { typ, name, value } => {
             let assign = loc(
                 Stmt::Assign {
-                    name: loc(name.data.clone(), name.location.clone()),
+                    name: loc(LValue::Ident(name.clone()), name.location.clone()),
                     value: elaborate_expr(value),
                 },
                 location.clone(),
             );
 
-            // a block is just a list of statements
-            let mut block = Vec::new();
-            block.push(assign);
+            let mut block = vec![assign];
             block.extend(rest);
             (
                 elaborate_typ(typ),
@@ -207,7 +238,10 @@ fn elaborate_typ(typ: CLTyp) -> LTyp {
     let data = match typ.data {
         CTyp::Int => Typ::Int,
         CTyp::Bool => Typ::Bool,
-        CTyp::Named(x) => Typ::Named(x),
+        CTyp::Alias(t) => Typ::Alias(t),
+        CTyp::Struct(t) => Typ::Struct(t),
+        CTyp::Pointer(typ) => Typ::Pointer(Box::new(elaborate_typ(*typ))),
+        CTyp::Array(typ) => Typ::Array(Box::new(elaborate_typ(*typ))),
     };
 
     loc(data, typ.location)
@@ -234,24 +268,58 @@ fn elaborate_simp(simp: LSimp) -> LStmt {
     }
 }
 
-fn elaborate_assign(name: CLValue, asnop: CLAsnOp, value: CLExpr, src_loc: Location) -> LStmt {
+fn elaborate_lvalue(value: CLLValue) -> LLValue {
+    let location = value.location;
+    let data = match value.data {
+        CLValue::Ident(name) => LValue::Ident(name),
+        CLValue::Field { base, field } => LValue::Field {
+            base: Box::new(elaborate_lvalue(*base)),
+            field: loc(field.data, field.location),
+        },
+        CLValue::Arrow { base, field } => {
+            let deref_location = base.location.clone();
+            LValue::Field {
+                base: Box::new(loc(
+                    LValue::Deref(Box::new(elaborate_expr(*base))),
+                    deref_location,
+                )),
+                field: loc(field.data, field.location),
+            }
+        }
+        CLValue::Deref(value) => LValue::Deref(Box::new(elaborate_expr(*value))),
+        CLValue::Index { base, index } => LValue::Index {
+            base: Box::new(elaborate_lvalue(*base)),
+            index: Box::new(elaborate_expr(*index)),
+        },
+    };
+    loc(data, location)
+}
+
+fn elaborate_assign(name: CLLValue, asnop: CLAsnOp, value: CLExpr, src_loc: Location) -> LStmt {
+    let name = elaborate_lvalue(name);
     let value = elaborate_expr(value);
-    let ident = loc(Expr::Ident(name.data.clone()), name.location.clone());
+
+    if !matches!(&name.data, LValue::Ident(_)) && asnop.data != CAsnOp::Eq {
+        return loc(
+            Stmt::CompoundAssign {
+                name,
+                op: loc(asnop.data, asnop.location),
+                value,
+            },
+            src_loc,
+        );
+    }
+
+    let lhs = loc(Expr::LValue(name.clone()), name.location.clone());
     let op_location = asnop.location.clone();
 
-    // x += y -> x = x + y
+    // ident += y -> ident = x + y
     let rhs = match asn_to_binop(asnop.data) {
-        Some(op) => bin(loc(op, op_location), ident, value, src_loc.clone()),
+        Some(op) => bin(loc(op, op_location), lhs, value, src_loc.clone()),
         None => value,
     };
 
-    loc(
-        Stmt::Assign {
-            name: loc(name.data, name.location),
-            value: rhs,
-        },
-        src_loc,
-    )
+    loc(Stmt::Assign { name, value: rhs }, src_loc)
 }
 
 fn asn_to_binop(op: CAsnOp) -> Option<BinOp> {
@@ -270,7 +338,15 @@ fn asn_to_binop(op: CAsnOp) -> Option<BinOp> {
     }
 }
 
-fn elaborate_post(name: CLValue, postop: LPostOp, src_loc: Location) -> LStmt {
+fn elaborate_post(name: CLLValue, postop: LPostOp, src_loc: Location) -> LStmt {
+    let name = elaborate_lvalue(name);
+
+    // similar situation to x += y, but for postfixes like x++ (x = x + 1) or x-- (x = x - 1)
+    // we have to specially handle if x is not an identitifer
+    if !matches!(&name.data, LValue::Ident(_)) {
+        return loc(Stmt::Postfix { name, op: postop }, src_loc);
+    }
+
     let op_location = postop.location;
     // x++ -> x = x + 1;
     let op = match postop.data {
@@ -278,17 +354,11 @@ fn elaborate_post(name: CLValue, postop: LPostOp, src_loc: Location) -> LStmt {
         CPostOp::DoubleMinus => BinOp::Minus,
     };
 
-    let ident = loc(Expr::Ident(name.data.clone()), name.location.clone());
+    let ident = loc(Expr::LValue(name.clone()), name.location.clone());
     let one = loc(Expr::Int(1), src_loc.clone());
     let value = bin(loc(op, op_location), ident, one, src_loc.clone());
 
-    loc(
-        Stmt::Assign {
-            name: loc(name.data, name.location),
-            value,
-        },
-        src_loc,
-    )
+    loc(Stmt::Assign { name, value }, src_loc)
 }
 
 fn elaborate_for(
@@ -318,12 +388,10 @@ fn elaborate_for(
         // for (; ...)
         None => vec![make_for(None)],
         // for (int i; ...) OR for (int i = ...; ...)
-        Some(init) if matches!(init.data, CSimp::Decl(_)) => {
-            let decl = match init.data {
-                CSimp::Decl(decl) => decl,
-                _ => unreachable!(),
-            };
-
+        Some(Located {
+            data: CSimp::Decl(decl),
+            ..
+        }) => {
             match decl.data {
                 // variables declared in a for loop have its own scope
                 // declare i outside and place for body inside
@@ -350,7 +418,7 @@ fn elaborate_for(
                 CDecl::Init { typ, name, value } => {
                     let assign = loc(
                         Stmt::Assign {
-                            name: loc(name.data.clone(), name.location.clone()),
+                            name: loc(LValue::Ident(name.clone()), name.location.clone()),
                             value: elaborate_expr(value),
                         },
                         src_loc.clone(),
@@ -442,6 +510,27 @@ fn elaborate_fundef(
     }
 }
 
+fn elaborate_structdef(name: CLIdent, body: Option<Vec<CLStructField>>) -> GlobalDecl {
+    let ebody: Option<Vec<LStructField>> = body.map(|b| {
+        b.into_iter()
+            .map(|f| {
+                loc(
+                    StructField {
+                        typ: elaborate_typ(f.data.typ),
+                        name: loc(f.data.name.data, f.data.name.location),
+                    },
+                    f.location,
+                )
+            })
+            .collect()
+    });
+
+    GlobalDecl::StructDef {
+        name: loc(name.data, name.location),
+        body: ebody,
+    }
+}
+
 fn elaborate_gdecl(gdecl: CLGlobalDecl) -> LGlobalDecl {
     let location = gdecl.location;
     let data = match gdecl.data {
@@ -452,6 +541,7 @@ fn elaborate_gdecl(gdecl: CLGlobalDecl) -> LGlobalDecl {
             params,
             body,
         } => elaborate_fundef(ret_typ, name, params, body),
+        CGlobalDecl::StructDef { name, body } => elaborate_structdef(name, body),
     };
 
     loc(data, location)

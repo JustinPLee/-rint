@@ -5,6 +5,7 @@ abstract pretty printers?
 name resolution explicit pass?
 
 intern strings, String -> VarId
-memory, arrays, structs
+simplify code (better fn names/signatures)
+    arrays, generics
 
 ir_linear -> CFG -> (SSA (locations?) -> Optimize) -> ir_linear -> ...

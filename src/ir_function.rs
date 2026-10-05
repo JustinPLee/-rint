@@ -2,8 +2,9 @@
 
 use std::fmt;
 
-use crate::ast::{LIdent, LTyp};
+use crate::ast::LIdent;
 use crate::ir_linear;
+use crate::ir_linear::ValueWidth;
 pub use crate::ir_linear::{LPseudoOp, PseudoOp};
 use crate::location::{Located, loc};
 use crate::utils::{Label, Temp};
@@ -33,14 +34,16 @@ pub fn abstract_name(register: Register) -> &'static str {
         Register::Rcx => "arg4",
         Register::R8 => "arg5",
         Register::R9 => "arg6",
+        // caller
         Register::R10 => "ler7",
         Register::R11 => "ler8",
-        Register::Rbx => "cal9",
-        Register::Rbp => "cal10",
-        Register::R12 => "cal11",
-        Register::R13 => "cal12",
-        Register::R14 => "cal13",
-        Register::R15 => "cal14",
+        // callee
+        Register::Rbx => "lee9",
+        Register::Rbp => "lee10",
+        Register::R12 => "lee11",
+        Register::R13 => "lee12",
+        Register::R14 => "lee13",
+        Register::R15 => "lee14",
         Register::Rsp => "rsp",
     }
 }
@@ -68,12 +71,31 @@ pub enum Instr {
     Move {
         dest: LOperand,
         src: LOperand,
+        width: ValueWidth,
     },
     BinOp {
         dest: LOperand,
         lhs: LOperand,
         op: LPseudoOp,
         rhs: LOperand,
+        width: ValueWidth,
+    },
+    Load {
+        dest: LOperand,
+        address: LOperand,
+        width: ValueWidth,
+    },
+    Store {
+        address: LOperand,
+        src: LOperand,
+        width: ValueWidth,
+    },
+    Address {
+        dest: LOperand,
+        base: LOperand,
+        index: Option<LOperand>,
+        scale: u8,
+        displacement: i32,
     },
     Return,
     Call {
@@ -90,6 +112,7 @@ pub enum Instr {
         rhs: LOperand,
         true_target: Label,
         false_target: Label,
+        width: ValueWidth,
     },
     Label(Label),
 }
@@ -104,7 +127,6 @@ pub struct Program(pub Vec<LInstr>);
 pub struct Function {
     pub name: LIdent,
     pub params: Vec<Temp>,
-    pub ret_type: LTyp,
     pub body: Program,
 }
 
@@ -123,25 +145,6 @@ fn trans_oper(oper: &ir_linear::LOperand) -> LOperand {
     )
 }
 
-// Linear IR already makes body-internal fallthrough explicit. Parameter copies
-// are prepended here, so add the entry edge when the body starts with a label.
-fn add_entry_jump_after_params(mut instrs: Vec<LInstr>, param_count: usize) -> Vec<LInstr> {
-    if param_count == 0 {
-        return instrs;
-    }
-
-    let entry_label = instrs.get(param_count).and_then(|instr| match &instr.data {
-        Instr::Label(label) => Some((*label, instr.location.clone())),
-        _ => None,
-    });
-
-    if let Some((label, location)) = entry_label {
-        instrs.insert(param_count, loc(Instr::Jump(label), location));
-    }
-
-    instrs
-}
-
 fn trans_function(function: &ir_linear::Function) -> Function {
     let location = function
         .body
@@ -150,41 +153,99 @@ fn trans_function(function: &ir_linear::Function) -> Function {
         .map(|instr| instr.location.clone())
         .unwrap_or_else(|| function.name.location.clone());
     let mut body = Vec::new();
-    let mut emit = |data, location| body.push(loc(data, location));
 
     for (i, &param) in function.params.iter().enumerate() {
-        emit(
+        let (dest, src) = (
+            loc(Operand::Temp(param), location.clone()),
+            loc(
+                Operand::FunctionSlot(FunctionSlot::Arg(i)),
+                location.clone(),
+            ),
+        );
+        body.push(loc(
             Instr::Move {
-                dest: loc(Operand::Temp(param), location.clone()),
-                src: loc(
-                    Operand::FunctionSlot(FunctionSlot::Arg(i)),
-                    location.clone(),
-                ),
+                dest,
+                src,
+                width: function.param_widths[i],
             },
             location.clone(),
-        );
+        ));
     }
 
     for instr in &function.body.0 {
         let src_loc = instr.location.clone();
         match &instr.data {
-            ir_linear::Instr::Move { dest, src } => emit(
+            ir_linear::Instr::Move { dest, src, width } => body.push(loc(
                 Instr::Move {
                     dest: trans_oper(dest),
                     src: trans_oper(src),
+                    width: *width,
                 },
                 src_loc,
-            ),
-            ir_linear::Instr::BinOp { dest, lhs, op, rhs } => emit(
+            )),
+            ir_linear::Instr::BinOp {
+                dest,
+                lhs,
+                op,
+                rhs,
+                width,
+            } => body.push(loc(
                 Instr::BinOp {
                     dest: trans_oper(dest),
                     lhs: trans_oper(lhs),
                     op: op.clone(),
                     rhs: trans_oper(rhs),
+                    width: *width,
                 },
                 src_loc,
-            ),
-            ir_linear::Instr::Call { dest, callee, args } => {
+            )),
+            ir_linear::Instr::Load {
+                dest,
+                address,
+                width,
+            } => body.push(loc(
+                Instr::Load {
+                    dest: trans_oper(dest),
+                    address: trans_oper(address),
+                    width: *width,
+                },
+                src_loc,
+            )),
+            ir_linear::Instr::Store {
+                address,
+                src,
+                width,
+            } => body.push(loc(
+                Instr::Store {
+                    address: trans_oper(address),
+                    src: trans_oper(src),
+                    width: *width,
+                },
+                src_loc,
+            )),
+            ir_linear::Instr::Address {
+                dest,
+                base,
+                index,
+                scale,
+                displacement,
+            } => body.push(loc(
+                Instr::Address {
+                    dest: trans_oper(dest),
+                    base: trans_oper(base),
+                    index: index.as_ref().map(trans_oper),
+                    scale: *scale,
+                    displacement: *displacement,
+                },
+                src_loc,
+            )),
+            ir_linear::Instr::Call {
+                dest,
+                dest_width,
+                callee,
+                args,
+                arg_widths,
+            } => {
                 // r <- call f(a,b,c)
                 //
                 // t0 <- arg0
@@ -193,34 +254,44 @@ fn trans_function(function: &ir_linear::Function) -> Function {
                 // call f
                 // t3 <- res0
                 for (i, arg) in args.iter().enumerate() {
-                    emit(
+                    let (dest, src) = (
+                        loc(Operand::FunctionSlot(FunctionSlot::Arg(i)), src_loc.clone()),
+                        trans_oper(arg),
+                    );
+                    body.push(loc(
                         Instr::Move {
-                            dest: loc(Operand::FunctionSlot(FunctionSlot::Arg(i)), src_loc.clone()),
-                            src: trans_oper(arg),
+                            dest,
+                            src,
+                            width: arg_widths[i],
                         },
                         src_loc.clone(),
-                    );
+                    ));
                 }
 
-                emit(
+                body.push(loc(
                     Instr::Call {
                         callee: callee.clone(),
                         arg_count: args.len(),
                     },
                     src_loc.clone(),
-                );
+                ));
 
                 if let Some(dest) = dest {
-                    emit(
+                    let (dest, src) = (
+                        loc(Operand::Temp(*dest), src_loc.clone()),
+                        loc(
+                            Operand::FunctionSlot(FunctionSlot::ReturnValue),
+                            src_loc.clone(),
+                        ),
+                    );
+                    body.push(loc(
                         Instr::Move {
-                            dest: loc(Operand::Temp(*dest), src_loc.clone()),
-                            src: loc(
-                                Operand::FunctionSlot(FunctionSlot::ReturnValue),
-                                src_loc.clone(),
-                            ),
+                            dest,
+                            src,
+                            width: dest_width.expect("call result has a width"),
                         },
                         src_loc,
-                    );
+                    ));
                 }
             }
             ir_linear::Instr::Return(value) => {
@@ -231,46 +302,52 @@ fn trans_function(function: &ir_linear::Function) -> Function {
                 //
                 // ret
                 if let Some(value) = value {
-                    emit(
+                    let (dest, src) = (
+                        loc(
+                            Operand::FunctionSlot(FunctionSlot::ReturnValue),
+                            src_loc.clone(),
+                        ),
+                        trans_oper(value),
+                    );
+                    body.push(loc(
                         Instr::Move {
-                            dest: loc(
-                                Operand::FunctionSlot(FunctionSlot::ReturnValue),
-                                src_loc.clone(),
-                            ),
-                            src: trans_oper(value),
+                            dest,
+                            src,
+                            width: function.ret_width,
                         },
                         src_loc.clone(),
-                    );
+                    ));
                 }
-                emit(Instr::Return, src_loc);
+                body.push(loc(Instr::Return, src_loc));
             }
-            ir_linear::Instr::Abort => emit(Instr::Abort, src_loc),
-            ir_linear::Instr::Jump(label) => emit(Instr::Jump(*label), src_loc),
+            ir_linear::Instr::Abort => body.push(loc(Instr::Abort, src_loc)),
+            ir_linear::Instr::Jump(label) => body.push(loc(Instr::Jump(*label), src_loc)),
             ir_linear::Instr::CJump {
                 lhs,
                 op,
                 rhs,
                 true_target,
                 false_target,
-            } => emit(
+                width,
+            } => body.push(loc(
                 Instr::CJump {
                     lhs: trans_oper(lhs),
                     op: op.clone(),
                     rhs: trans_oper(rhs),
                     true_target: *true_target,
                     false_target: *false_target,
+                    width: *width,
                 },
                 src_loc,
-            ),
-            ir_linear::Instr::Label(label) => emit(Instr::Label(*label), src_loc),
+            )),
+            ir_linear::Instr::Label(label) => body.push(loc(Instr::Label(*label), src_loc)),
         }
     }
 
     Function {
         name: function.name.clone(),
         params: function.params.clone(),
-        ret_type: function.ret_type.clone(),
-        body: Program(add_entry_jump_after_params(body, function.params.len())),
+        body: Program(body),
     }
 }
 
@@ -304,8 +381,46 @@ impl fmt::Display for FunctionSlot {
 impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Move { dest, src } => write!(f, "{dest} ← {src}"),
-            Self::BinOp { dest, lhs, op, rhs } => write!(f, "{dest} ← {lhs} {op} {rhs}"),
+            Self::Move { dest, src, width } => {
+                let suffix = if *width == ValueWidth::Qword { "q" } else { "" };
+                write!(f, "{dest} ←{suffix} {src}")
+            }
+            Self::BinOp {
+                dest,
+                lhs,
+                op,
+                rhs,
+                width,
+            } => {
+                let suffix = if *width == ValueWidth::Qword { "q" } else { "" };
+                write!(f, "{dest} ←{suffix} {lhs} {op} {rhs}")
+            }
+            Self::Load {
+                dest,
+                address,
+                width,
+            } => write!(f, "{dest} ← load({width:?}) {address}"),
+            Self::Store {
+                address,
+                src,
+                width,
+            } => write!(f, "store({width:?}) {address} ← {src}"),
+            Self::Address {
+                dest,
+                base,
+                index,
+                scale,
+                displacement,
+            } => {
+                write!(f, "{dest} ← address({base}")?;
+                if let Some(index) = index {
+                    write!(f, " + {index} * {scale}")?;
+                }
+                if *displacement != 0 {
+                    write!(f, " + {displacement}")?;
+                }
+                write!(f, ")")
+            }
             Self::Return => f.write_str("return"),
             Self::Call { callee, .. } => write!(f, "call {callee}"),
             Self::Push(r) => write!(f, "push {}", abstract_name(*r)),
@@ -318,10 +433,14 @@ impl fmt::Display for Instr {
                 rhs,
                 true_target,
                 false_target,
-            } => write!(
-                f,
-                "if {lhs} {op} {rhs} jump {true_target} else jump {false_target}"
-            ),
+                width,
+            } => {
+                let suffix = if *width == ValueWidth::Qword { "q" } else { "" };
+                write!(
+                    f,
+                    "if{suffix} {lhs} {op} {rhs} jump {true_target} else jump {false_target}"
+                )
+            }
             Self::Label(label) => write!(f, "{label}:"),
         }
     }

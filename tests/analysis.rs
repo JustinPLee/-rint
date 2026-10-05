@@ -5,7 +5,6 @@ use rint::analysis::AnalysisErrorKind;
 use rint::driver::CompileError;
 
 use crate::helpers::assert_analysis_error;
-
 #[test]
 fn uninitialized_return() {
     let source = r#"
@@ -374,8 +373,8 @@ fn variable_name_is_typedef() {
 #[test]
 fn unknown_type_is_rejected() {
     let source = r#"
+    int b(a x) { return 0; }
     int main() {
-        Missing value;
         return 0;
     }
     "#;

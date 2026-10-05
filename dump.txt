@@ -1,38 +1,656 @@
 # Source program:
-bool not(bool b);
-bool not(bool b) {
-  return !b;
+struct Node {
+    int value;
+    struct Node* next;
+};
+
+typedef struct Node Node;
+
+Node* reverse_list(Node* head) {
+    Node* previous = null;
+    Node* current = head;
+
+    while (current != null) {
+        Node* next = current->next;
+        current->next = previous;
+        previous = current;
+        current = next;
+    }
+
+    return previous;
 }
 
 int main() {
-  return 2 + 4 % not(false) + 2;
+    Node* first = alloc(Node);
+    Node* second = alloc(Node);
+    Node* third = alloc(Node);
+
+    first->value = 1;
+    first->next = second;
+    second->value = 2;
+    second->next = third;
+    third->value = 3;
+    third->next = null;
+
+    Node* reversed = reverse_list(first);
+
+    if (reversed->value != 3) {
+        return 1;
+    }
+    if (reversed->next->value != 2) {
+        return 1;
+    }
+    if (reversed->next->next->value != 1) {
+        return 1;
+    }
+    if (reversed->next->next->next != null) {
+        return 1;
+    }
+
+    return 9;
 }
 
 # Lexed Tokens:
-[Bool, Ident("not"), LParen, Bool, Ident("b"), RParen, Semicolon, Bool, Ident("not"), LParen, Bool, Ident("b"), RParen, LBrace, Return, Exclam, Ident("b"), Semicolon, RBrace, Int, Ident("main"), LParen, RParen, LBrace, Return, Num(2), Plus, Num(4), Mod, Ident("not"), LParen, False, RParen, Plus, Num(2), Semicolon, RBrace, Eof]
+[Struct, Ident("Node"), LBrace, Int, Ident("value"), Semicolon, Struct, Ident("Node"), Star, Ident("next"), Semicolon, RBrace, Semicolon, Typedef, Struct, Ident("Node"), Ident("Node"), Semicolon, Ident("Node"), Star, Ident("reverse_list"), LParen, Ident("Node"), Star, Ident("head"), RParen, LBrace, Ident("Node"), Star, Ident("previous"), Eq, Null, Semicolon, Ident("Node"), Star, Ident("current"), Eq, Ident("head"), Semicolon, While, LParen, Ident("current"), NotEq, Null, RParen, LBrace, Ident("Node"), Star, Ident("next"), Eq, Ident("current"), Arrow, Ident("next"), Semicolon, Ident("current"), Arrow, Ident("next"), Eq, Ident("previous"), Semicolon, Ident("previous"), Eq, Ident("current"), Semicolon, Ident("current"), Eq, Ident("next"), Semicolon, RBrace, Return, Ident("previous"), Semicolon, RBrace, Int, Ident("main"), LParen, RParen, LBrace, Ident("Node"), Star, Ident("first"), Eq, Alloc, LParen, Ident("Node"), RParen, Semicolon, Ident("Node"), Star, Ident("second"), Eq, Alloc, LParen, Ident("Node"), RParen, Semicolon, Ident("Node"), Star, Ident("third"), Eq, Alloc, LParen, Ident("Node"), RParen, Semicolon, Ident("first"), Arrow, Ident("value"), Eq, Num(1), Semicolon, Ident("first"), Arrow, Ident("next"), Eq, Ident("second"), Semicolon, Ident("second"), Arrow, Ident("value"), Eq, Num(2), Semicolon, Ident("second"), Arrow, Ident("next"), Eq, Ident("third"), Semicolon, Ident("third"), Arrow, Ident("value"), Eq, Num(3), Semicolon, Ident("third"), Arrow, Ident("next"), Eq, Null, Semicolon, Ident("Node"), Star, Ident("reversed"), Eq, Ident("reverse_list"), LParen, Ident("first"), RParen, Semicolon, If, LParen, Ident("reversed"), Arrow, Ident("value"), NotEq, Num(3), RParen, LBrace, Return, Num(1), Semicolon, RBrace, If, LParen, Ident("reversed"), Arrow, Ident("next"), Arrow, Ident("value"), NotEq, Num(2), RParen, LBrace, Return, Num(1), Semicolon, RBrace, If, LParen, Ident("reversed"), Arrow, Ident("next"), Arrow, Ident("next"), Arrow, Ident("value"), NotEq, Num(1), RParen, LBrace, Return, Num(1), Semicolon, RBrace, If, LParen, Ident("reversed"), Arrow, Ident("next"), Arrow, Ident("next"), Arrow, Ident("next"), NotEq, Null, RParen, LBrace, Return, Num(1), Semicolon, RBrace, Return, Num(9), Semicolon, RBrace, Eof]
 
 # Parse AST:
 (program
-  (fun_def bool not [bool b])
-  (fun_def bool not [bool b]
+  (struct Node [int value; struct Node* next])
+  (typedef struct Node Node)
+  (fun_def Node* reverse_list [Node* head]
     (block
-      (return (! b))
+      (declare previous Node* null)
+      (declare current Node* head)
+      (while (!= current null)
+        (block
+            (declare next Node* (field-deref current next))
+            (assign (field-deref current next) previous)
+            (assign previous current)
+            (assign current next)
+          )
+      (return previous)
     ))
   (fun_def int main []
     (block
-      (return (+ (+ 2 (% 4 (call not false))) 2))
+      (declare first Node* (alloc Node))
+      (declare second Node* (alloc Node))
+      (declare third Node* (alloc Node))
+      (assign (field-deref first value) 1)
+      (assign (field-deref first next) second)
+      (assign (field-deref second value) 2)
+      (assign (field-deref second next) third)
+      (assign (field-deref third value) 3)
+      (assign (field-deref third next) null)
+      (declare reversed Node* (call reverse_list first))
+      (if (!= (field-deref reversed value) 3)
+        (then (block
+          (return 1)
+        )))
+      (if (!= (field-deref (field-deref reversed next) value) 2)
+        (then (block
+          (return 1)
+        )))
+      (if (!= (field-deref (field-deref (field-deref reversed next) next) value) 1)
+        (then (block
+          (return 1)
+        )))
+      (if (!= (field-deref (field-deref (field-deref reversed next) next) next) null)
+        (then (block
+          (return 1)
+        )))
+      (return 9)
     ))
 )
 
 # AST:
 (program
-  (fun_def bool not [bool b])
-  (fun_def bool not [bool b]
+  (struct Node [int value; struct Node* next])
+  (typedef struct Node Node)
+  (fun_def Node* reverse_list [Node* head]
     (block
-      (return (== b false))
+      (declare previous Node*
+        (block
+          (assign previous null)
+          (declare current Node*
+            (block
+              (assign current head)
+              (while (!= current null)
+                (block
+                    (declare next Node*
+                      (block
+                        (assign next (field-access (deref current) next))
+                        (assign (field-access (deref current) next) previous)
+                        (assign previous current)
+                        (assign current next)
+                      ))
+                  )
+              (return previous)
+            ))
+        ))
     ))
   (fun_def int main []
     (block
-      (return (+ (+ 2 (% 4 (call not false))) 2))
+      (declare first Node*
+        (block
+          (assign first (alloc Node))
+          (declare second Node*
+            (block
+              (assign second (alloc Node))
+              (declare third Node*
+                (block
+                  (assign third (alloc Node))
+                  (assign (field-access (deref first) value) 1)
+                  (assign (field-access (deref first) next) second)
+                  (assign (field-access (deref second) value) 2)
+                  (assign (field-access (deref second) next) third)
+                  (assign (field-access (deref third) value) 3)
+                  (assign (field-access (deref third) next) null)
+                  (declare reversed Node*
+                    (block
+                      (assign reversed (call reverse_list first))
+                      (if (!= (field-access (deref reversed) value) 3)
+                        (then (block
+                          (return 1)
+                        )))
+                      (if (!= (field-access (deref (field-access (deref reversed) next)) value) 2)
+                        (then (block
+                          (return 1)
+                        )))
+                      (if (!= (field-access (deref (field-access (deref (field-access (deref reversed) next)) next)) value) 1)
+                        (then (block
+                          (return 1)
+                        )))
+                      (if (!= (field-access (deref (field-access (deref (field-access (deref reversed) next)) next)) next) null)
+                        (then (block
+                          (return 1)
+                        )))
+                      (return 9)
+                    ))
+                ))
+            ))
+        ))
     ))
 )
+
+# (IR) linear:
+fn reverse_list(t0):
+    t1 ←q 0
+    t2 ←q t0
+    jump .L1
+.L1:
+    ifq t2 != 0 jump .L0 else jump .L2
+.L0:
+    ifq t2 != 0 jump .L3 else jump .L_null_deref_abort
+.L3:
+    t4 ← address(t2 + 8)
+    t5 ← load(Qword) t4
+    t3 ←q t5
+    ifq t2 != 0 jump .L4 else jump .L_null_deref_abort
+.L4:
+    t6 ← address(t2 + 8)
+    store(Qword) t6 ← t1
+    t1 ←q t2
+    t2 ←q t3
+    jump .L1
+.L2:
+    return t1
+.L_null_deref_abort:
+    abort
+
+fn main():
+    t8 ← call calloc(1, 16)
+    ifq t8 != 0 jump .L5 else jump .L_null_deref_abort
+.L5:
+    t7 ←q t8
+    t10 ← call calloc(1, 16)
+    ifq t10 != 0 jump .L6 else jump .L_null_deref_abort
+.L6:
+    t9 ←q t10
+    t12 ← call calloc(1, 16)
+    ifq t12 != 0 jump .L7 else jump .L_null_deref_abort
+.L7:
+    t11 ←q t12
+    ifq t7 != 0 jump .L8 else jump .L_null_deref_abort
+.L8:
+    t13 ← address(t7)
+    store(Dword) t13 ← 1
+    ifq t7 != 0 jump .L9 else jump .L_null_deref_abort
+.L9:
+    t14 ← address(t7 + 8)
+    store(Qword) t14 ← t9
+    ifq t9 != 0 jump .L10 else jump .L_null_deref_abort
+.L10:
+    t15 ← address(t9)
+    store(Dword) t15 ← 2
+    ifq t9 != 0 jump .L11 else jump .L_null_deref_abort
+.L11:
+    t16 ← address(t9 + 8)
+    store(Qword) t16 ← t11
+    ifq t11 != 0 jump .L12 else jump .L_null_deref_abort
+.L12:
+    t17 ← address(t11)
+    store(Dword) t17 ← 3
+    ifq t11 != 0 jump .L13 else jump .L_null_deref_abort
+.L13:
+    t18 ← address(t11 + 8)
+    store(Qword) t18 ← 0
+    t20 ← call reverse_list(t7)
+    t19 ←q t20
+    ifq t19 != 0 jump .L16 else jump .L_null_deref_abort
+.L16:
+    t21 ← address(t19)
+    t22 ← load(Dword) t21
+    if t22 != 3 jump .L14 else jump .L15
+.L14:
+    return 1
+.L15:
+    jump .L17
+.L17:
+    ifq t19 != 0 jump .L20 else jump .L_null_deref_abort
+.L20:
+    t23 ← address(t19 + 8)
+    t24 ← load(Qword) t23
+    ifq t24 != 0 jump .L21 else jump .L_null_deref_abort
+.L21:
+    t25 ← address(t24)
+    t26 ← load(Dword) t25
+    if t26 != 2 jump .L18 else jump .L19
+.L18:
+    return 1
+.L19:
+    jump .L22
+.L22:
+    ifq t19 != 0 jump .L25 else jump .L_null_deref_abort
+.L25:
+    t27 ← address(t19 + 8)
+    t28 ← load(Qword) t27
+    ifq t28 != 0 jump .L26 else jump .L_null_deref_abort
+.L26:
+    t29 ← address(t28 + 8)
+    t30 ← load(Qword) t29
+    ifq t30 != 0 jump .L27 else jump .L_null_deref_abort
+.L27:
+    t31 ← address(t30)
+    t32 ← load(Dword) t31
+    if t32 != 1 jump .L23 else jump .L24
+.L23:
+    return 1
+.L24:
+    jump .L28
+.L28:
+    ifq t19 != 0 jump .L31 else jump .L_null_deref_abort
+.L31:
+    t33 ← address(t19 + 8)
+    t34 ← load(Qword) t33
+    ifq t34 != 0 jump .L32 else jump .L_null_deref_abort
+.L32:
+    t35 ← address(t34 + 8)
+    t36 ← load(Qword) t35
+    ifq t36 != 0 jump .L33 else jump .L_null_deref_abort
+.L33:
+    t37 ← address(t36 + 8)
+    t38 ← load(Qword) t37
+    ifq t38 != 0 jump .L29 else jump .L30
+.L29:
+    return 1
+.L30:
+    jump .L34
+.L34:
+    return 9
+.L_null_deref_abort:
+    abort
+
+
+# (IR) function with calling convention:
+fn reverse_list(t0):
+    t0 ←q arg1
+    t1 ←q 0
+    t2 ←q t0
+    jump .L1
+.L1:
+    ifq t2 != 0 jump .L0 else jump .L2
+.L0:
+    ifq t2 != 0 jump .L3 else jump .L_null_deref_abort
+.L3:
+    t4 ← address(t2 + 8)
+    t5 ← load(Qword) t4
+    t3 ←q t5
+    ifq t2 != 0 jump .L4 else jump .L_null_deref_abort
+.L4:
+    t6 ← address(t2 + 8)
+    store(Qword) t6 ← t1
+    t1 ←q t2
+    t2 ←q t3
+    jump .L1
+.L2:
+    res0 ←q t1
+    return
+.L_null_deref_abort:
+    abort
+
+fn main():
+    arg1 ←q 1
+    arg2 ←q 16
+    call calloc
+    t8 ←q res0
+    ifq t8 != 0 jump .L5 else jump .L_null_deref_abort
+.L5:
+    t7 ←q t8
+    arg1 ←q 1
+    arg2 ←q 16
+    call calloc
+    t10 ←q res0
+    ifq t10 != 0 jump .L6 else jump .L_null_deref_abort
+.L6:
+    t9 ←q t10
+    arg1 ←q 1
+    arg2 ←q 16
+    call calloc
+    t12 ←q res0
+    ifq t12 != 0 jump .L7 else jump .L_null_deref_abort
+.L7:
+    t11 ←q t12
+    ifq t7 != 0 jump .L8 else jump .L_null_deref_abort
+.L8:
+    t13 ← address(t7)
+    store(Dword) t13 ← 1
+    ifq t7 != 0 jump .L9 else jump .L_null_deref_abort
+.L9:
+    t14 ← address(t7 + 8)
+    store(Qword) t14 ← t9
+    ifq t9 != 0 jump .L10 else jump .L_null_deref_abort
+.L10:
+    t15 ← address(t9)
+    store(Dword) t15 ← 2
+    ifq t9 != 0 jump .L11 else jump .L_null_deref_abort
+.L11:
+    t16 ← address(t9 + 8)
+    store(Qword) t16 ← t11
+    ifq t11 != 0 jump .L12 else jump .L_null_deref_abort
+.L12:
+    t17 ← address(t11)
+    store(Dword) t17 ← 3
+    ifq t11 != 0 jump .L13 else jump .L_null_deref_abort
+.L13:
+    t18 ← address(t11 + 8)
+    store(Qword) t18 ← 0
+    arg1 ←q t7
+    call reverse_list
+    t20 ←q res0
+    t19 ←q t20
+    ifq t19 != 0 jump .L16 else jump .L_null_deref_abort
+.L16:
+    t21 ← address(t19)
+    t22 ← load(Dword) t21
+    if t22 != 3 jump .L14 else jump .L15
+.L14:
+    res0 ← 1
+    return
+.L15:
+    jump .L17
+.L17:
+    ifq t19 != 0 jump .L20 else jump .L_null_deref_abort
+.L20:
+    t23 ← address(t19 + 8)
+    t24 ← load(Qword) t23
+    ifq t24 != 0 jump .L21 else jump .L_null_deref_abort
+.L21:
+    t25 ← address(t24)
+    t26 ← load(Dword) t25
+    if t26 != 2 jump .L18 else jump .L19
+.L18:
+    res0 ← 1
+    return
+.L19:
+    jump .L22
+.L22:
+    ifq t19 != 0 jump .L25 else jump .L_null_deref_abort
+.L25:
+    t27 ← address(t19 + 8)
+    t28 ← load(Qword) t27
+    ifq t28 != 0 jump .L26 else jump .L_null_deref_abort
+.L26:
+    t29 ← address(t28 + 8)
+    t30 ← load(Qword) t29
+    ifq t30 != 0 jump .L27 else jump .L_null_deref_abort
+.L27:
+    t31 ← address(t30)
+    t32 ← load(Dword) t31
+    if t32 != 1 jump .L23 else jump .L24
+.L23:
+    res0 ← 1
+    return
+.L24:
+    jump .L28
+.L28:
+    ifq t19 != 0 jump .L31 else jump .L_null_deref_abort
+.L31:
+    t33 ← address(t19 + 8)
+    t34 ← load(Qword) t33
+    ifq t34 != 0 jump .L32 else jump .L_null_deref_abort
+.L32:
+    t35 ← address(t34 + 8)
+    t36 ← load(Qword) t35
+    ifq t36 != 0 jump .L33 else jump .L_null_deref_abort
+.L33:
+    t37 ← address(t36 + 8)
+    t38 ← load(Qword) t37
+    ifq t38 != 0 jump .L29 else jump .L30
+.L29:
+    res0 ← 1
+    return
+.L30:
+    jump .L34
+.L34:
+    res0 ← 9
+    return
+.L_null_deref_abort:
+    abort
+
+# Emitted assembly:
+.text
+.globl reverse_list
+.type reverse_list, @function
+reverse_list:
+    pushq %rbp
+    movq %rsp, %rbp
+    movq %rdi, %rax
+    movq $0, %rdi
+    movq %rax, %rdx
+    jmp .L1
+.L1:
+    cmpq $0, %rdx
+    je .L2
+.L0:
+    cmpq $0, %rdx
+    je .L_null_deref_abort
+.L3:
+    leaq 8(%rdx), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    movq %rax, %rcx
+    cmpq $0, %rdx
+    je .L_null_deref_abort
+.L4:
+    leaq 8(%rdx), %rax
+    movq %rax, %r10
+    movq %rdi, (%r10)
+    movq %rdx, %rdi
+    movq %rcx, %rdx
+    jmp .L1
+.L2:
+    movq %rdi, %rax
+    jmp .L35
+.L35:
+    popq %rbp
+    ret
+.size reverse_list, .-reverse_list
+
+.globl main
+.type main, @function
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    pushq %rbx
+    pushq %r12
+    movq $1, %rdi
+    movq $16, %rsi
+    call calloc
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L5:
+    movq %rax, %r12
+    movq $1, %rdi
+    movq $16, %rsi
+    call calloc
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L6:
+    movq %rax, %rbx
+    movq $1, %rdi
+    movq $16, %rsi
+    call calloc
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L7:
+    movq %rax, %rcx
+    cmpq $0, %r12
+    je .L_null_deref_abort
+.L8:
+    leaq (%r12), %rax
+    movq %rax, %r10
+    movl $1, (%r10)
+    cmpq $0, %r12
+    je .L_null_deref_abort
+.L9:
+    leaq 8(%r12), %rax
+    movq %rax, %r10
+    movq %rbx, (%r10)
+    cmpq $0, %rbx
+    je .L_null_deref_abort
+.L10:
+    leaq (%rbx), %rax
+    movq %rax, %r10
+    movl $2, (%r10)
+    cmpq $0, %rbx
+    je .L_null_deref_abort
+.L11:
+    leaq 8(%rbx), %rax
+    movq %rax, %r10
+    movq %rcx, (%r10)
+    cmpq $0, %rcx
+    je .L_null_deref_abort
+.L12:
+    leaq (%rcx), %rax
+    movq %rax, %r10
+    movl $3, (%r10)
+    cmpq $0, %rcx
+    je .L_null_deref_abort
+.L13:
+    leaq 8(%rcx), %rax
+    movq %rax, %r10
+    movq $0, (%r10)
+    movq %r12, %rdi
+    call reverse_list
+    movq %rax, %rcx
+    cmpq $0, %rcx
+    je .L_null_deref_abort
+.L16:
+    leaq (%rcx), %rax
+    movq %rax, %r10
+    movl (%r10), %eax
+    cmpl $3, %eax
+    je .L15
+.L14:
+    movl $1, %eax
+    jmp .L36
+.L15:
+    jmp .L17
+.L17:
+    cmpq $0, %rcx
+    je .L_null_deref_abort
+.L20:
+    leaq 8(%rcx), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L21:
+    leaq (%rax), %rax
+    movq %rax, %r10
+    movl (%r10), %eax
+    cmpl $2, %eax
+    je .L19
+.L18:
+    movl $1, %eax
+    jmp .L36
+.L19:
+    jmp .L22
+.L22:
+    cmpq $0, %rcx
+    je .L_null_deref_abort
+.L25:
+    leaq 8(%rcx), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L26:
+    leaq 8(%rax), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L27:
+    leaq (%rax), %rax
+    movq %rax, %r10
+    movl (%r10), %eax
+    cmpl $1, %eax
+    je .L24
+.L23:
+    movl $1, %eax
+    jmp .L36
+.L24:
+    jmp .L28
+.L28:
+    cmpq $0, %rcx
+    je .L_null_deref_abort
+.L31:
+    leaq 8(%rcx), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L32:
+    leaq 8(%rax), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    cmpq $0, %rax
+    je .L_null_deref_abort
+.L33:
+    leaq 8(%rax), %rax
+    movq %rax, %r10
+    movq (%r10), %rax
+    cmpq $0, %rax
+    je .L30
+.L29:
+    movl $1, %eax
+    jmp .L36
+.L30:
+    jmp .L34
+.L34:
+    movl $9, %eax
+    jmp .L36
+.L36:
+    popq %r12
+    popq %rbx
+    popq %rbp
+    ret
+.size main, .-main
+
+.L_null_deref_abort:
+    call abort
+.section .note.GNU-stack,"",@progbits
+
+# Result:
+9

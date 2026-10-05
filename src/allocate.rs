@@ -85,7 +85,7 @@ fn first_free_register(
 
 // find arg0 <- t or t <- arg0 pair
 fn arg_move_pair(instr: &Instr) -> Option<(Node, Node)> {
-    let Instr::Move { dest, src } = instr else {
+    let Instr::Move { dest, src, .. } = instr else {
         return None;
     };
 
@@ -291,6 +291,7 @@ impl fmt::Display for Allocation {
 mod tests {
     use super::*;
     use crate::ir_function::{FunctionSlot, Operand, PseudoOp};
+    use crate::ir_linear::ValueWidth;
     use crate::location::{Location, loc};
 
     #[test]
@@ -303,10 +304,12 @@ mod tests {
             Instr::Move {
                 dest: operand(b.clone()),
                 src: operand(Operand::FunctionSlot(FunctionSlot::Arg(0))),
+                width: ValueWidth::Dword,
             },
             Instr::Move {
                 dest: operand(Operand::FunctionSlot(FunctionSlot::Arg(0))),
                 src: operand(b.clone()),
+                width: ValueWidth::Dword,
             },
             Instr::Call {
                 callee: loc("pow".to_string(), Location::default()),
@@ -315,16 +318,19 @@ mod tests {
             Instr::Move {
                 dest: operand(result.clone()),
                 src: operand(Operand::FunctionSlot(FunctionSlot::ReturnValue)),
+                width: ValueWidth::Dword,
             },
             Instr::BinOp {
                 dest: operand(product.clone()),
                 lhs: operand(b),
                 op: loc(PseudoOp::Mul, Location::default()),
                 rhs: operand(result),
+                width: ValueWidth::Dword,
             },
             Instr::Move {
                 dest: operand(Operand::FunctionSlot(FunctionSlot::ReturnValue)),
                 src: operand(product),
+                width: ValueWidth::Dword,
             },
             Instr::Return,
         ];

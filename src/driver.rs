@@ -7,13 +7,12 @@ use crate::analysis::{AnalysisError, semantic_analysis};
 use crate::cfg::analyze_cfg;
 use crate::diagnostic::report_diags;
 use crate::elaboration::elaborate;
-use crate::ir_function;
-use crate::ir_linear::translate;
 use crate::lexer::{LexError, Lexer};
 use crate::parser::{ParseError, Parser};
 use crate::token::Token;
 use crate::utils::{LabelGen, TempGen};
 use crate::x86::emit_assembly;
+use crate::{ir_function, ir_linear};
 
 // pub struct Options {  do optimizations? dump specific phases? }
 
@@ -63,16 +62,16 @@ pub fn compile_source(filename: &str, source: &str) -> Result<String, CompileErr
     let ast = elaborate(ast_parse);
     writeln!(dumpfile, "\n# AST:\n{}", ast).expect("file write");
 
-    // Semantic Analysis
-    if let Err(err) = semantic_analysis(&ast) {
-        report_diags(source, &[err.clone()]);
-        return Err(CompileError::Analysis(err));
-    }
+    // Semantic analysis
+    let types = semantic_analysis(&ast).map_err(|err| {
+        report_diags(source, std::slice::from_ref(&err));
+        CompileError::Analysis(err)
+    })?;
 
     // IR linear code
     let mut temps = TempGen::new();
     let mut labels = LabelGen::new();
-    let module = translate(&ast.data, &mut temps, &mut labels);
+    let module = ir_linear::translate(&ast.data, &types, &mut temps, &mut labels);
     writeln!(dumpfile, "\n# (IR) linear:\n{}", module).expect("file write");
 
     // IR function code
@@ -87,7 +86,7 @@ pub fn compile_source(filename: &str, source: &str) -> Result<String, CompileErr
     // CFG analysis checking
     // Initialization and returns checks
     if let Err(err) = analyze_cfg(&function_ir) {
-        report_diags(source, &[err.clone()]);
+        report_diags(source, std::slice::from_ref(&err));
         return Err(CompileError::Analysis(err));
     }
 
@@ -125,7 +124,6 @@ pub fn run_with_file(filename: &str, source: &str) -> Result<i32, CompileError> 
         let result = Command::new("./out").status().expect("runs");
         // append to dumpfile
         let mut dumpfile = OpenOptions::new()
-            .write(true)
             .append(true)
             .open(DUMPFILE)
             .expect("file opened");

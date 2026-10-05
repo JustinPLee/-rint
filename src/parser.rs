@@ -2,17 +2,25 @@
 
 use crate::ast_parse::{
     AsnOp, BinOp, Block, Control, Decl, Expr, GlobalDecl, LAsnOp, LBlock, LControl, LDecl, LExpr,
-    LGlobalDecl, LIdent, LParam, LProgram, LRetTyp, LSimp, LStmt, LTyp, LValue, Param, PostOp,
-    Program, RetTyp, Simp, Stmt, Typ, UnOp,
+    LGlobalDecl, LIdent, LLValue, LParam, LProgram, LRetTyp, LSimp, LStmt, LStructField, LTyp,
+    LValue, Param, PostOp, Program, RetTyp, Simp, Stmt, StructField, Typ, UnOp,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::location::{Located, Location, loc};
 use crate::token::{LToken, Token};
+use std::collections::HashSet;
 
 pub struct Parser {
     tokens: Vec<LToken>,
     errors: Vec<ParseError>,
-    last_location: Location,
+    last_location: Location, // uesd for location tracking
+    // hack for context aware parsing, avoids backtracking by tracking which idents have been parsed
+    // as a type
+    // disambiguates situations such as x * y: is it a multiplication expression
+    // or a declaration of variable y with type pointer to x
+    // primitive types such as int and bool are reserved types, so this is ok
+    // however, typedefs can create type aliases so types can be an arbitrary identifier
+    type_aliases: HashSet<String>,
 }
 
 #[derive(Eq, PartialEq, Clone, Debug)]
@@ -56,6 +64,7 @@ impl Parser {
             tokens,
             errors: Vec::new(),
             last_location: Location::default(),
+            type_aliases: HashSet::new(),
         }
     }
 
@@ -63,8 +72,12 @@ impl Parser {
         self.tokens.last().map(|lt| &lt.data)
     }
 
-    fn peek_next(&self) -> Option<&Token> {
+    fn peek2(&self) -> Option<&Token> {
         self.tokens.iter().rev().nth(1).map(|lt| &lt.data)
+    }
+
+    fn peek3(&self) -> Option<&Token> {
+        self.tokens.iter().rev().nth(2).map(|lt| &lt.data)
     }
 
     fn next(&mut self) -> Option<LToken> {
@@ -148,10 +161,22 @@ impl Parser {
         let mut gdecls = Vec::new();
         while matches!(
             self.peek(),
-            Some(Token::Typedef | Token::Int | Token::Bool | Token::Void | Token::Ident(_))
+            Some(
+                Token::Typedef
+                    | Token::Int
+                    | Token::Bool
+                    | Token::Void
+                    | Token::Struct
+                    | Token::Ident(_)
+            )
         ) {
             let decl = match self.peek() {
                 Some(Token::Typedef) => self.parse_typedef()?,
+                Some(Token::Struct)
+                    if matches!(self.peek3(), Some(Token::LBrace | Token::Semicolon)) =>
+                {
+                    self.parse_structdef()?
+                }
                 _ => self.parse_fun_def()?,
             };
             gdecls.push(decl);
@@ -164,12 +189,57 @@ impl Parser {
         Ok(loc(Program(gdecls), location))
     }
 
+    fn parse_structdef(&mut self) -> ParseResult<LGlobalDecl> {
+        let start = self.current_location().clone();
+        self.try_consume(&Token::Struct)?;
+        let name = self.parse_ident()?;
+        let body = match self.peek() {
+            Some(Token::Semicolon) => {
+                self.next();
+                GlobalDecl::StructDef { name, body: None }
+            }
+            Some(Token::LBrace) => {
+                let body = self.parse_structfields()?;
+                GlobalDecl::StructDef {
+                    name,
+                    body: Some(body),
+                }
+            }
+            _ => {
+                let location = self.current_location().clone();
+                return Err(self.process_error(ParseErrorKind::UnexpectedToken, None, location));
+            }
+        };
+        Ok(loc(body, self.start_to_last(start)))
+    }
+
+    fn parse_structfields(&mut self) -> ParseResult<Vec<LStructField>> {
+        self.try_consume(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Some(Token::RBrace | Token::Eof) | None) {
+            fields.push(self.parse_structfield()?);
+        }
+        self.try_consume(&Token::RBrace)?;
+        self.try_consume(&Token::Semicolon)?;
+
+        Ok(fields)
+    }
+
+    fn parse_structfield(&mut self) -> ParseResult<LStructField> {
+        let start = self.current_location().clone();
+        let typ = self.parse_typ()?;
+        let name = self.parse_ident()?;
+        self.try_consume(&Token::Semicolon)?;
+        Ok(loc(StructField { typ, name }, self.start_to_last(start)))
+    }
+
     fn parse_typedef(&mut self) -> ParseResult<LGlobalDecl> {
         let start = self.current_location().clone();
         self.try_consume(&Token::Typedef)?;
         let typ = self.parse_typ()?;
         let alias = self.parse_ident()?;
         self.try_consume(&Token::Semicolon)?;
+        self.type_aliases.insert(alias.data.clone());
         Ok(loc(
             GlobalDecl::Typedef { typ, alias },
             self.start_to_last(start),
@@ -229,7 +299,7 @@ impl Parser {
 
     fn parse_params(&mut self) -> ParseResult<Vec<LParam>> {
         if matches!(
-            (self.peek(), self.peek_next()),
+            (self.peek(), self.peek2()),
             (Some(Token::LParen), Some(Token::RParen))
         ) {
             self.next(); // (
@@ -290,30 +360,60 @@ impl Parser {
     }
 
     fn parse_typ(&mut self) -> ParseResult<LTyp> {
-        match self.peek() {
+        let mut typ = match self.peek() {
             Some(Token::Int) => {
                 let token = self.try_consume(&Token::Int)?;
-                Ok(loc(Typ::Int, token.location))
+                loc(Typ::Int, token.location)
             }
             Some(Token::Bool) => {
                 let token = self.try_consume(&Token::Bool)?;
-                Ok(loc(Typ::Bool, token.location))
+                loc(Typ::Bool, token.location)
+            }
+            Some(Token::Struct) => {
+                let start = self.try_consume(&Token::Struct)?.location;
+                let name = self.parse_ident()?;
+                let location = start.merge(&name.location);
+                loc(Typ::Struct(name), location)
             }
             Some(Token::Ident(_)) => {
                 let token = self.parse_ident()?;
-                Ok(loc(Typ::Named(token.data), token.location))
+                let location = token.location.clone();
+                loc(Typ::Alias(token), location)
             }
-            None => Err(self.process_error(
-                ParseErrorKind::UnexpectedEof,
-                None,
-                self.current_location().clone(),
-            )),
-            _ => Err(self.process_error(
-                ParseErrorKind::InvalidType,
-                None,
-                self.current_location().clone(),
-            )),
+            None => {
+                return Err(self.process_error(
+                    ParseErrorKind::UnexpectedEof,
+                    None,
+                    self.current_location().clone(),
+                ));
+            }
+            _ => {
+                return Err(self.process_error(
+                    ParseErrorKind::InvalidType,
+                    None,
+                    self.current_location().clone(),
+                ));
+            }
+        };
+
+        loop {
+            match self.peek() {
+                Some(Token::Star) => {
+                    let star = self.next().unwrap();
+                    let location = typ.location.clone().merge(&star.location);
+                    typ = loc(Typ::Pointer(Box::new(typ)), location);
+                }
+                Some(Token::LBracket) => {
+                    self.next();
+                    let end = self.try_consume(&Token::RBracket)?.location;
+                    let location = typ.location.clone().merge(&end);
+                    typ = loc(Typ::Array(Box::new(typ)), location);
+                }
+                _ => break,
+            }
         }
+
+        Ok(typ)
     }
 
     fn parse_stmt(&mut self) -> ParseResult<LStmt> {
@@ -482,32 +582,24 @@ impl Parser {
     fn parse_simp(&mut self) -> ParseResult<LSimp> {
         let start = self.current_location().clone();
         match self.peek() {
-            Some(Token::Int | Token::Bool) => {
+            Some(Token::Int | Token::Bool | Token::Struct) => {
                 let decl = self.parse_decl()?;
                 Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
             }
-            Some(Token::Ident(_)) => match self.peek_next() {
-                Some(Token::DoubleMinus) | Some(Token::DoublePlus) => self.parse_postfix(),
-                Some(Token::LParen) => Ok(loc(
-                    Simp::Expr(self.parse_expr()?),
-                    self.start_to_last(start),
-                )),
+            Some(Token::Ident(name)) => match self.peek2() {
                 // check if the first identifier was actually a type from a typedef
                 // if so, then <ident> <ident> is the start of a variable declaration
-                Some(Token::Ident(_)) => {
+                Some(Token::Ident(_)) if self.type_aliases.contains(name) => {
                     let decl = self.parse_decl()?;
                     Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
                 }
-                _ => {
-                    let name = self.parse_lvalue()?;
-                    let asnop = self.parse_asnop()?;
-                    let value = self.parse_expr()?;
-                    Ok(loc(
-                        Simp::Assign { name, asnop, value },
-                        self.start_to_last(start),
-                    ))
+                Some(Token::Star) if self.type_aliases.contains(name) => {
+                    let decl = self.parse_decl()?;
+                    Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
                 }
+                _ => self.parse_expr_or_assign(),
             },
+            Some(Token::LParen) => self.parse_expr_or_assign(),
             _ => Ok(loc(
                 Simp::Expr(self.parse_expr()?),
                 self.start_to_last(start),
@@ -531,9 +623,7 @@ impl Parser {
         }
     }
 
-    fn parse_postfix(&mut self) -> ParseResult<LSimp> {
-        let start = self.current_location().clone();
-        let lvalue = self.parse_lvalue()?;
+    fn parse_postfix(&mut self, lvalue: LLValue) -> ParseResult<LSimp> {
         let postop = match self.next() {
             Some(Located {
                 data: Token::DoubleMinus,
@@ -543,10 +633,7 @@ impl Parser {
                 data: Token::DoublePlus,
                 location,
             }) => loc(PostOp::DoublePlus, location),
-            Some(Located { location, .. }) => {
-                return Err(self.process_error(ParseErrorKind::InvalidOperator, None, location));
-            }
-            None => {
+            _ => {
                 return Err(self.process_error(
                     ParseErrorKind::UnexpectedEof,
                     None,
@@ -554,12 +641,13 @@ impl Parser {
                 ));
             }
         };
+        let location = lvalue.location.clone().merge(&postop.location);
         Ok(loc(
             Simp::Post {
                 name: lvalue,
                 postop,
             },
-            self.start_to_last(start),
+            location,
         ))
     }
 
@@ -580,7 +668,7 @@ impl Parser {
         }
     }
 
-    fn parse_call(&mut self, name: LIdent, start: Location) -> ParseResult<LExpr> {
+    fn parse_call(&mut self, name: LIdent) -> ParseResult<LExpr> {
         self.try_consume(&Token::LParen)?;
 
         let mut args = Vec::new();
@@ -596,26 +684,65 @@ impl Parser {
             }
         }
 
-        self.try_consume(&Token::RParen)?;
+        let end = self.try_consume(&Token::RParen)?.location;
 
-        Ok(loc(Expr::FunCall { name, args }, self.start_to_last(start)))
+        let location = name.location.clone().merge(&end);
+        Ok(loc(Expr::FunCall { name, args }, location))
     }
 
-    fn parse_lvalue(&mut self) -> ParseResult<LValue> {
-        match self.next() {
-            Some(Located {
-                data: Token::Ident(name),
-                location,
-            }) => Ok(loc(name, location)),
-            Some(Located { location, .. }) => {
-                Err(self.process_error(ParseErrorKind::InvalidExpression, None, location))
+    fn parse_expr_or_assign(&mut self) -> ParseResult<LSimp> {
+        let expr = self.parse_expr()?;
+
+        match self.peek() {
+            Some(Token::DoubleMinus | Token::DoublePlus) => {
+                let lvalue = self.expr_to_lvalue(expr)?;
+                self.parse_postfix(lvalue)
             }
-            None => Err(self.process_error(
-                ParseErrorKind::UnexpectedEof,
-                None,
-                self.current_location().clone(),
-            )),
+            Some(
+                Token::Eq
+                | Token::PlusEq
+                | Token::MinusEq
+                | Token::StarEq
+                | Token::DivEq
+                | Token::ModEq
+                | Token::AndEq
+                | Token::XorEq
+                | Token::OrEq
+                | Token::LShiftEq
+                | Token::RShiftEq,
+            ) => {
+                let name = self.expr_to_lvalue(expr)?;
+                let asnop = self.parse_asnop()?;
+                let value = self.parse_expr()?;
+                let location = name.location.clone().merge(&value.location);
+                Ok(loc(Simp::Assign { name, asnop, value }, location))
+            }
+            _ => {
+                let location = expr.location.clone();
+                Ok(loc(Simp::Expr(expr), location))
+            }
         }
+    }
+
+    fn expr_to_lvalue(&mut self, expr: LExpr) -> ParseResult<LLValue> {
+        let location = expr.location.clone();
+        let data = match expr.data {
+            Expr::Ident(name) => LValue::Ident(name),
+            Expr::Field { ident, field } => LValue::Field {
+                base: Box::new(self.expr_to_lvalue(*ident)?),
+                field,
+            },
+            Expr::Arrow { base, field } => LValue::Arrow { base, field },
+            Expr::Deref(value) => LValue::Deref(value),
+            Expr::Index { base, index } => LValue::Index {
+                base: Box::new(self.expr_to_lvalue(*base)?),
+                index,
+            },
+            _ => {
+                return Err(self.process_error(ParseErrorKind::InvalidExpression, None, location));
+            }
+        };
+        Ok(loc(data, location))
     }
 
     fn parse_asnop(&mut self) -> ParseResult<LAsnOp> {
@@ -624,7 +751,7 @@ impl Parser {
             Token::Eq => AsnOp::Eq,
             Token::PlusEq => AsnOp::PlusEq,
             Token::MinusEq => AsnOp::MinusEq,
-            Token::TimesEq => AsnOp::TimesEq,
+            Token::StarEq => AsnOp::TimesEq,
             Token::DivEq => AsnOp::DivEq,
             Token::ModEq => AsnOp::ModEq,
             Token::AndEq => AsnOp::AndEq,
@@ -634,7 +761,7 @@ impl Parser {
             Token::RShiftEq => AsnOp::RShiftEq,
             _ => {
                 return Err(self.process_error(
-                    ParseErrorKind::InvalidOperator,
+                    ParseErrorKind::UnexpectedToken,
                     None,
                     token.location,
                 ));
@@ -650,48 +777,97 @@ impl Parser {
     }
 
     fn parse_expr_impl(&mut self, min_bp: u8) -> ParseResult<LExpr> {
+        // parse prefix
         let mut lhs = self.parse_prefix()?;
 
         while let Some(tok) = self.peek() {
-            let Some((kind, left_bp, right_bp)) = Infix::bp(tok) else {
-                break;
-            };
+            // parse postfix
+            if let Some(bp) = postfix_bp(tok) {
+                if bp < min_bp {
+                    break;
+                }
 
-            if left_bp < min_bp {
-                break;
+                let op = self.next().unwrap().data;
+                lhs = match op {
+                    Token::LBracket => {
+                        let index = self.parse_expr()?;
+                        let end = self.try_consume(&Token::RBracket)?.location;
+                        let location = lhs.location.clone().merge(&end);
+                        loc(
+                            Expr::Index {
+                                base: Box::new(lhs),
+                                index: Box::new(index),
+                            },
+                            location,
+                        )
+                    }
+                    Token::Dot => {
+                        let field = self.parse_ident()?;
+                        let location = lhs.location.clone().merge(&field.location);
+                        loc(
+                            Expr::Field {
+                                ident: Box::new(lhs),
+                                field,
+                            },
+                            location,
+                        )
+                    }
+                    Token::Arrow => {
+                        let field = self.parse_ident()?;
+                        let location = lhs.location.clone().merge(&field.location);
+                        loc(
+                            Expr::Arrow {
+                                base: Box::new(lhs),
+                                field,
+                            },
+                            location,
+                        )
+                    }
+                    _ => panic!(),
+                };
+                continue;
             }
 
-            let op_location = self.next().expect("infix was peeked").location;
-            lhs = match kind {
-                Infix::Binary(op) => {
-                    let rhs = self.parse_expr_impl(right_bp)?;
-                    let location = lhs.location.clone().merge(&rhs.location);
-
-                    loc(
-                        Expr::BinOp {
-                            op: loc(op, op_location),
-                            lhs: Box::new(lhs),
-                            rhs: Box::new(rhs),
-                        },
-                        location,
-                    )
+            // parse infix
+            if let Some((kind, left_bp, right_bp)) = Infix::bp(tok) {
+                if left_bp < min_bp {
+                    break;
                 }
-                Infix::Ternary => {
-                    let true_expr = self.parse_expr_impl(right_bp)?;
-                    self.try_consume(&Token::Colon)?;
-                    let false_expr = self.parse_expr_impl(right_bp)?;
 
-                    let location = lhs.location.clone().merge(&false_expr.location);
-                    loc(
-                        Expr::TernOp {
-                            cond: Box::new(lhs),
-                            true_expr: Box::new(true_expr),
-                            false_expr: Box::new(false_expr),
-                        },
-                        location,
-                    )
-                }
-            };
+                let op_location = self.next().unwrap().location;
+                lhs = match kind {
+                    Infix::Binary(op) => {
+                        let rhs = self.parse_expr_impl(right_bp)?;
+                        let location = lhs.location.clone().merge(&rhs.location);
+
+                        loc(
+                            Expr::BinOp {
+                                op: loc(op, op_location),
+                                lhs: Box::new(lhs),
+                                rhs: Box::new(rhs),
+                            },
+                            location,
+                        )
+                    }
+                    Infix::Ternary => {
+                        let true_expr = self.parse_expr_impl(right_bp)?;
+                        self.try_consume(&Token::Colon)?;
+                        let false_expr = self.parse_expr_impl(right_bp)?;
+
+                        let location = lhs.location.clone().merge(&false_expr.location);
+                        loc(
+                            Expr::TernOp {
+                                cond: Box::new(lhs),
+                                true_expr: Box::new(true_expr),
+                                false_expr: Box::new(false_expr),
+                            },
+                            location,
+                        )
+                    }
+                };
+            } else {
+                break;
+            }
         }
 
         Ok(lhs)
@@ -721,11 +897,32 @@ impl Parser {
         match tok {
             Token::True => Ok(loc(Expr::True, start)),
             Token::False => Ok(loc(Expr::False, start)),
+            Token::Null => Ok(loc(Expr::Null, start)),
             Token::Num(n) => Ok(loc(Expr::Int(n), start)),
-            Token::Ident(name) if self.peek() == Some(&Token::LParen) => {
-                self.parse_call(loc(name, start.clone()), start)
+            Token::Alloc => {
+                self.try_consume(&Token::LParen)?;
+                let typ = self.parse_typ()?;
+                self.try_consume(&Token::RParen)?;
+                Ok(loc(Expr::Alloc(typ), self.start_to_last(start)))
             }
-            Token::Ident(name) => Ok(loc(Expr::Ident(name), start)),
+            Token::AllocArray => {
+                self.try_consume(&Token::LParen)?;
+                let typ = self.parse_typ()?;
+                self.try_consume(&Token::Comma)?;
+                let size = self.parse_expr()?;
+                self.try_consume(&Token::RParen)?;
+                Ok(loc(
+                    Expr::AllocArray {
+                        typ,
+                        size: Box::new(size),
+                    },
+                    self.start_to_last(start),
+                ))
+            }
+            Token::Ident(name) if self.peek() == Some(&Token::LParen) => {
+                self.parse_call(loc(name, start))
+            }
+            Token::Ident(name) => Ok(loc(Expr::Ident(loc(name, start.clone())), start)),
             Token::LParen => {
                 let expr = self.parse_expr()?;
                 self.try_consume(&Token::RParen)?;
@@ -758,6 +955,13 @@ impl Parser {
                     location,
                 ))
             }
+            Token::Star => {
+                let right_bp = prefix_bp(&Token::Star).unwrap();
+                let operand = self.parse_expr_impl(right_bp)?;
+                let location = self.start_to_last(start);
+
+                Ok(loc(Expr::Deref(Box::new(operand)), location))
+            }
 
             _tok => Err(self.process_error(ParseErrorKind::InvalidExpression, None, start)),
         }
@@ -786,17 +990,24 @@ impl Parser {
 
 fn prefix_bp(tok: &Token) -> Option<u8> {
     let res = match tok {
-        Token::Minus | Token::Exclam => 25,
+        Token::Minus | Token::Exclam | Token::Star => 25,
         _ => return None,
     };
 
     Some(res)
 }
 
+fn postfix_bp(tok: &Token) -> Option<u8> {
+    match tok {
+        Token::Dot | Token::Arrow | Token::LBracket => Some(26),
+        _ => None,
+    }
+}
+
 impl Infix {
     /*
-        ()
-        ! - ++ --          (right)
+        () [] -> .
+        ! - ++ -- ~ *     (right)
         * / %
         + -
         << >>
@@ -837,7 +1048,7 @@ impl Infix {
             Token::Plus => (Self::Binary(BinOp::Plus), 21, 22),
             Token::Minus => (Self::Binary(BinOp::Minus), 21, 22),
 
-            Token::Times => (Self::Binary(BinOp::Times), 23, 24),
+            Token::Star => (Self::Binary(BinOp::Times), 23, 24),
             Token::Div => (Self::Binary(BinOp::Div), 23, 24),
             Token::Mod => (Self::Binary(BinOp::Mod), 23, 24),
 
@@ -924,6 +1135,7 @@ mod tests {
                 match op.data {
                     UnOp::Negate => -1 * oper,
                     UnOp::Exclam => oper ^ 1,
+                    UnOp::BitNot => !oper,
                 }
             }
             Expr::TernOp {
@@ -939,7 +1151,7 @@ mod tests {
                     interpret_expr(&false_expr.data)
                 }
             }
-            Expr::FunCall { name: _, args: _ } => todo!(),
+            _ => panic!("non-numeric expression in numeric parser test"),
         }
     }
 
@@ -1038,18 +1250,6 @@ mod tests {
             "#;
 
         assert_parse_error(source, ParseErrorKind::InvalidExpression);
-    }
-
-    #[test]
-    fn invalid_operator() {
-        let source = r#"
-            int main() {
-                x;
-                return 0;
-            }
-            "#;
-
-        assert_parse_error(source, ParseErrorKind::InvalidOperator);
     }
 
     #[test]

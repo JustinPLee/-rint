@@ -5,7 +5,7 @@ use std::fmt;
 pub enum Token {
     Plus,
     Minus,
-    Times,
+    Star,
     Div,
     Mod,
     RShift, // bit shifts not implemented
@@ -25,7 +25,7 @@ pub enum Token {
 
     PlusEq,
     MinusEq,
-    TimesEq,
+    StarEq,
     DivEq,
     ModEq,
     LShiftEq,
@@ -42,10 +42,14 @@ pub enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Semicolon,
     Question,
     Colon,
     Comma,
+    Dot,
+    Arrow,
 
     Struct,
     Typedef,
@@ -89,7 +93,7 @@ pub fn string_to_keyword(s: &str) -> Option<Token> {
         "assert" => Some(Token::Assert),
         "true" => Some(Token::True),
         "false" => Some(Token::False),
-        "NULL" => Some(Token::Null),
+        "null" => Some(Token::Null),
         "alloc" => Some(Token::Alloc),
         "alloc_array" => Some(Token::AllocArray),
         "int" => Some(Token::Int),
@@ -106,7 +110,7 @@ impl fmt::Display for Token {
         let s = match self {
             Token::Plus => "+".to_string(),
             Token::Minus => "-".to_string(),
-            Token::Times => "*".to_string(),
+            Token::Star => "*".to_string(),
             Token::Div => "/".to_string(),
             Token::Mod => "%".to_string(),
             Token::Exclam => "!".to_string(),
@@ -116,7 +120,7 @@ impl fmt::Display for Token {
             Token::LogicAnd => "&&".to_string(),
             Token::LogicOr => "||".to_string(),
 
-            Token::TimesEq => "*=".to_string(),
+            Token::StarEq => "*=".to_string(),
             Token::PlusEq => "+=".to_string(),
             Token::MinusEq => "-=".to_string(),
             Token::DivEq => "/=".to_string(),
@@ -127,6 +131,8 @@ impl fmt::Display for Token {
             Token::RParen => ")".to_string(),
             Token::LBrace => "{".to_string(),
             Token::RBrace => "}".to_string(),
+            Token::LBracket => "[".to_string(),
+            Token::RBracket => "]".to_string(),
             Token::Semicolon => ";".to_string(),
             Token::Comma => ",".to_string(),
 
@@ -142,7 +148,7 @@ impl fmt::Display for Token {
             Token::Assert => "assert".to_string(),
             Token::True => "true".to_string(),
             Token::False => "false".to_string(),
-            Token::Null => "NULL".to_string(),
+            Token::Null => "null".to_string(),
             Token::Alloc => "alloc".to_string(),
             Token::AllocArray => "alloc_array".to_string(),
             Token::Int => "int".to_string(),
@@ -172,6 +178,8 @@ impl fmt::Display for Token {
             Token::Question => "?".to_string(),
             Token::Colon => ":".to_string(),
             Token::DoublePlus => "++".to_string(),
+            Token::Dot => ".".to_string(),
+            Token::Arrow => "->".to_string(),
         };
 
         write!(f, "{}", s)

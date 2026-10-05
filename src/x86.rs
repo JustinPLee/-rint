@@ -3,7 +3,8 @@
 
 use crate::allocate::{Allocation, PhysLoc, SpillSlot, allocate};
 use crate::ir_function::{Function, FunctionSlot, Instr as IrInstr, Module, Operand, PseudoOp};
-use crate::utils::{Label, LabelGen};
+use crate::ir_linear::ValueWidth;
+use crate::utils::{LABEL_ABORT_NULL_DEREF, Label, LabelGen};
 use core::fmt;
 
 // System V ABI for linux, macos, bsd
@@ -39,8 +40,8 @@ pub const ARG_REGS: [Register; 6] = [
 const SCRATCH: Register = Register::R11;
 pub const RETURN_REG: Register = Register::Rax;
 const STACK_ALIGNMENT: u32 = 16;
-const BYTES_PER_SPILL: u32 = 4; // only 32 bit values are supported for now, change later
-const BYTES_PER_REG: u32 = 8; // only 32 bit values are supported for now, change later
+const BYTES_PER_SPILL: u32 = 8;
+const BYTES_PER_REG: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Width {
@@ -162,6 +163,8 @@ struct ActivationRecord {
 pub struct Memory {
     pub offset: i32,
     pub base: Register,
+    pub index: Option<Register>,
+    pub scale: u8,
 }
 
 // no temps
@@ -178,6 +181,11 @@ pub enum Instr {
         width: Width,
         dest: X86Operand,
         src: X86Operand,
+    },
+    // calculate address
+    Lea {
+        dest: Register,
+        src: Memory,
     },
     Add {
         width: Width,
@@ -288,6 +296,8 @@ fn resolve_operand(
                 PhysLoc::SpillSlot(SpillSlot(slot)) => X86Operand::Mem(Memory {
                     offset: frame.spill_offset(SpillSlot(*slot)),
                     base: Register::Rbp,
+                    index: None,
+                    scale: 1,
                 }),
             }
         }
@@ -306,6 +316,8 @@ fn resolve_incoming_arg(index: usize) -> X86Operand {
             offset: ((2 * BYTES_PER_REG) + ((index - ARG_REGS.len()) as u32 * BYTES_PER_REG))
                 as i32,
             base: Register::Rbp,
+            index: None,
+            scale: 1,
         })
     }
 }
@@ -382,8 +394,13 @@ fn lower_basic_binop(
     }
 }
 
-fn lower_binop(op: PseudoOp, dest: X86Operand, lhs: X86Operand, rhs: X86Operand) -> Vec<Instr> {
-    const WIDTH: Width = Width::Dword;
+fn lower_binop_width(
+    op: PseudoOp,
+    dest: X86Operand,
+    lhs: X86Operand,
+    rhs: X86Operand,
+    width: Width,
+) -> Vec<Instr> {
     match op {
         PseudoOp::Add
         | PseudoOp::Sub
@@ -391,15 +408,15 @@ fn lower_binop(op: PseudoOp, dest: X86Operand, lhs: X86Operand, rhs: X86Operand)
         | PseudoOp::Or
         | PseudoOp::BitAnd
         | PseudoOp::BitOr
-        | PseudoOp::BitXor => lower_basic_binop(op, dest, lhs, rhs, WIDTH),
-        PseudoOp::Mul => lower_mul(dest, lhs, rhs, WIDTH),
-        PseudoOp::Div | PseudoOp::Mod => lower_div_mod(op, dest, lhs, rhs, WIDTH),
+        | PseudoOp::BitXor => lower_basic_binop(op, dest, lhs, rhs, width),
+        PseudoOp::Mul => lower_mul(dest, lhs, rhs, width),
+        PseudoOp::Div | PseudoOp::Mod => lower_div_mod(op, dest, lhs, rhs, width),
         PseudoOp::Less
         | PseudoOp::LessEq
         | PseudoOp::Greater
         | PseudoOp::GreaterEq
         | PseudoOp::EqualEq
-        | PseudoOp::NotEq => comparison_op(op, dest, lhs, rhs),
+        | PseudoOp::NotEq => comparison_op(op, dest, lhs, rhs, width),
     }
 }
 
@@ -465,7 +482,13 @@ fn lower_div_mod(
     result
 }
 
-fn comparison_op(op: PseudoOp, dest: X86Operand, lhs: X86Operand, rhs: X86Operand) -> Vec<Instr> {
+fn comparison_op(
+    op: PseudoOp,
+    dest: X86Operand,
+    lhs: X86Operand,
+    rhs: X86Operand,
+    width: Width,
+) -> Vec<Instr> {
     // mov    lhs, scratch
     // cmp    rhs, scratch
     // set    scratch
@@ -474,9 +497,9 @@ fn comparison_op(op: PseudoOp, dest: X86Operand, lhs: X86Operand, rhs: X86Operan
     let scratch = X86Operand::Reg(SCRATCH);
     let mut result = Vec::new();
 
-    result.extend(normalize_move(scratch, lhs, Width::Dword));
+    result.extend(normalize_move(scratch, lhs, width));
     result.push(Instr::Cmp {
-        width: Width::Dword,
+        width,
         lhs: rhs,
         rhs: scratch,
     });
@@ -504,18 +527,133 @@ fn comparison_op_to_set(op: PseudoOp) -> Instr {
     }
 }
 
-fn lower_move(
+fn lower_move_width(
     dest: &Operand,
     src: &Operand,
     allocation: &Allocation,
     frame: &ActivationRecord,
+    width: Width,
 ) -> Vec<Instr> {
     let dest = match dest {
         Operand::FunctionSlot(FunctionSlot::Arg(index)) => resolve_outgoing_arg(*index),
         operand => resolve_operand(operand, allocation, frame),
     };
     let src = resolve_operand(src, allocation, frame);
-    normalize_move(dest, src, Width::Dword)
+    normalize_move(dest, src, width)
+}
+
+fn value_width(width: ValueWidth) -> Width {
+    match width {
+        ValueWidth::Dword => Width::Dword,
+        ValueWidth::Qword => Width::Qword,
+    }
+}
+
+fn address_component(
+    operand: &Operand,
+    scratch: Register,
+    allocation: &Allocation,
+    frame: &ActivationRecord,
+) -> (Vec<Instr>, Register) {
+    match resolve_operand(operand, allocation, frame) {
+        X86Operand::Reg(register) => (Vec::new(), register),
+        source => (
+            normalize_move(X86Operand::Reg(scratch), source, Width::Qword),
+            scratch,
+        ),
+    }
+}
+
+fn lower_address(
+    dest: &Operand,
+    base: &Operand,
+    index: Option<&Operand>,
+    scale: u8,
+    displacement: i32,
+    allocation: &Allocation,
+    frame: &ActivationRecord,
+) -> Vec<Instr> {
+    assert!(matches!(scale, 1 | 2 | 4 | 8), "invalid x86 address scale");
+
+    let (mut result, base) = address_component(base, SCRATCH, allocation, frame);
+    let index = if let Some(index) = index {
+        let (instructions, register) = address_component(index, Register::R10, allocation, frame);
+        result.extend(instructions);
+        Some(register)
+    } else {
+        None
+    };
+
+    let dest_location = resolve_operand(dest, allocation, frame);
+    let (dest_register, spilled_dest) = match dest_location {
+        X86Operand::Reg(register) => (register, false),
+        X86Operand::Mem(_) => (SCRATCH, true),
+        X86Operand::Imm(_) => panic!("address destination must be a temp"),
+    };
+
+    result.push(Instr::Lea {
+        dest: dest_register,
+        src: Memory {
+            offset: displacement,
+            base,
+            index,
+            scale,
+        },
+    });
+    if spilled_dest {
+        result.extend(normalize_move(
+            dest_location,
+            X86Operand::Reg(dest_register),
+            Width::Qword,
+        ));
+    }
+    result
+}
+
+fn lower_load(
+    dest: &Operand,
+    address: &Operand,
+    width: ValueWidth,
+    allocation: &Allocation,
+    frame: &ActivationRecord,
+) -> Vec<Instr> {
+    let width = value_width(width);
+    let address = resolve_operand(address, allocation, frame);
+    let mut result = normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
+    let source = X86Operand::Mem(Memory {
+        offset: 0,
+        base: Register::R10,
+        index: None,
+        scale: 1,
+    });
+    let dest = resolve_operand(dest, allocation, frame);
+
+    result.extend(normalize_move(dest, source, width));
+
+    result
+}
+
+fn lower_store(
+    address: &Operand,
+    src: &Operand,
+    width: ValueWidth,
+    allocation: &Allocation,
+    frame: &ActivationRecord,
+) -> Vec<Instr> {
+    let width = value_width(width);
+    let address = resolve_operand(address, allocation, frame);
+    let mut result = normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
+    let dest = X86Operand::Mem(Memory {
+        offset: 0,
+        base: Register::R10,
+        index: None,
+        scale: 1,
+    });
+    let src = resolve_operand(src, allocation, frame);
+
+    result.extend(normalize_move(dest, src, width));
+
+    result
 }
 
 fn resolve_outgoing_arg(index: usize) -> X86Operand {
@@ -525,6 +663,8 @@ fn resolve_outgoing_arg(index: usize) -> X86Operand {
         X86Operand::Mem(Memory {
             offset: ((index - ARG_REGS.len()) as i32) * BYTES_PER_REG as i32,
             base: Register::Rsp,
+            index: None,
+            scale: 1,
         })
     }
 }
@@ -536,6 +676,7 @@ fn lower_cjump(
     false_label: Label,
     allocation: &Allocation,
     frame: &ActivationRecord,
+    width: Width,
 ) -> Vec<Instr> {
     let lhs = resolve_operand(lhs, allocation, frame);
     let rhs = resolve_operand(rhs, allocation, frame);
@@ -543,14 +684,14 @@ fn lower_cjump(
         && !matches!((lhs, rhs), (X86Operand::Mem(_), X86Operand::Mem(_)))
     {
         vec![Instr::Cmp {
-            width: Width::Dword,
+            width,
             lhs: rhs,
             rhs: lhs,
         }]
     } else {
-        let mut result = normalize_move(X86Operand::Reg(SCRATCH), lhs, Width::Dword);
+        let mut result = normalize_move(X86Operand::Reg(SCRATCH), lhs, width);
         result.push(Instr::Cmp {
-            width: Width::Dword,
+            width,
             lhs: rhs,
             rhs: X86Operand::Reg(SCRATCH),
         });
@@ -583,13 +724,50 @@ fn lower_instr(
     epilogue_label: Label,
 ) -> Vec<Instr> {
     match instr {
-        IrInstr::Move { dest, src } => lower_move(&dest.data, &src.data, allocation, frame),
-        IrInstr::BinOp { op, dest, lhs, rhs } => {
+        IrInstr::Move { dest, src, width } => lower_move_width(
+            &dest.data,
+            &src.data,
+            allocation,
+            frame,
+            value_width(*width),
+        ),
+        IrInstr::BinOp {
+            op,
+            dest,
+            lhs,
+            rhs,
+            width,
+        } => {
             let dest = resolve_operand(&dest.data, allocation, frame);
             let lhs = resolve_operand(&lhs.data, allocation, frame);
             let rhs = resolve_operand(&rhs.data, allocation, frame);
-            lower_binop(op.data, dest, lhs, rhs)
+            lower_binop_width(op.data, dest, lhs, rhs, value_width(*width))
         }
+        IrInstr::Load {
+            dest,
+            address,
+            width,
+        } => lower_load(&dest.data, &address.data, *width, allocation, frame),
+        IrInstr::Store {
+            address,
+            src,
+            width,
+        } => lower_store(&address.data, &src.data, *width, allocation, frame),
+        IrInstr::Address {
+            dest,
+            base,
+            index,
+            scale,
+            displacement,
+        } => lower_address(
+            &dest.data,
+            &base.data,
+            index.as_ref().map(|index| &index.data),
+            *scale,
+            *displacement,
+            allocation,
+            frame,
+        ),
         IrInstr::Call { callee, .. } => vec![Instr::Call(callee.data.clone())],
         IrInstr::Return => vec![Instr::Jmp(epilogue_label)],
         IrInstr::Jump(label) => vec![Instr::Jmp(*label)],
@@ -598,6 +776,7 @@ fn lower_instr(
             op,
             rhs,
             false_target: false_label,
+            width,
             ..
         } => lower_cjump(
             &lhs.data,
@@ -606,6 +785,7 @@ fn lower_instr(
             *false_label,
             allocation,
             frame,
+            value_width(*width),
         ),
         IrInstr::Abort => vec![Instr::Call("abort".to_string())],
         IrInstr::Label(label) => vec![Instr::Label(*label)],
@@ -660,7 +840,17 @@ pub fn lower_instrs(
 
     let mut result = emit_prologue(&frame);
 
-    for instr in instrs {
+    let mut instrs = instrs.iter().peekable();
+    while let Some(instr) = instrs.next() {
+        if matches!(instr, IrInstr::Label(label) if *label == LABEL_ABORT_NULL_DEREF) {
+            // although the ir has abort for each function,
+            // there should only be one for the whole program
+            // kind of messy
+            if matches!(instrs.peek(), Some(IrInstr::Abort)) {
+                instrs.next();
+            }
+            continue;
+        }
         result.extend(lower_instr(instr, allocation, &frame, epilogue_label));
     }
 
@@ -706,7 +896,7 @@ pub fn emit_assembly(module: &Module, labelgen: &mut LabelGen) -> String {
         text.push_str(&emit_function_assembly(function, &allocation, labelgen));
         text.push('\n');
     }
-
+    text.push_str(&format!("{LABEL_ABORT_NULL_DEREF}:\n    call abort\n"));
     // added to silence warnings (?)
     text.push_str(".section .note.GNU-stack,\"\",@progbits\n");
 
@@ -755,10 +945,19 @@ impl ActivationRecord {
 
 impl Memory {
     fn asm(self) -> String {
-        if self.offset == 0 {
-            format!("({})", self.base.name(Width::Qword))
+        let base = self.base.name(Width::Qword);
+        let displacement = if self.offset == 0 {
+            String::new()
         } else {
-            format!("{}({})", self.offset, self.base.name(Width::Qword))
+            self.offset.to_string()
+        };
+        match self.index {
+            Some(index) => format!(
+                "{displacement}({base},{},{})",
+                index.name(Width::Qword),
+                self.scale
+            ),
+            None => format!("{displacement}({base})"),
         }
     }
 }
@@ -779,6 +978,7 @@ impl Instr {
     fn base(&self) -> &'static str {
         match self {
             Self::Mov { .. } => "mov",
+            Self::Lea { .. } => "leaq",
             Self::Add { .. } => "add",
             Self::Sub { .. } => "sub",
             Self::And { .. } => "and",
@@ -825,6 +1025,13 @@ impl Instr {
 impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.clone() {
+            Self::Lea { dest, src } => write!(
+                f,
+                "    {} {}, {}",
+                self.base(),
+                src.asm(),
+                dest.name(Width::Qword)
+            ),
             Self::Mov { width, dest, src }
             | Self::Add { width, dest, src }
             | Self::Sub { width, dest, src }

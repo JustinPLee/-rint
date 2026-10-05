@@ -1,21 +1,46 @@
+use itertools::Itertools;
+
 use crate::location::Located;
 use crate::utils::{Pretty, write_indent};
 use std::fmt::Write;
 
-pub use crate::ast_parse::BinOp;
+pub use crate::ast_parse::{AsnOp, BinOp, PostOp};
 
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Typ {
     Int,
     Bool,
     Void,
-    Named(String),
+    Alias(LIdent),
+    Struct(LIdent),
+    Pointer(Box<LTyp>),
+    Array(Box<LTyp>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Param {
     pub typ: LTyp,
     pub name: LIdent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructField {
+    pub typ: LTyp,
+    pub name: LIdent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LValue {
+    Ident(LIdent),
+    Field {
+        base: Box<LLValue>,
+        field: LIdent,
+    },
+    Deref(Box<LExpr>),
+    Index {
+        base: Box<LLValue>,
+        index: Box<LExpr>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -30,14 +55,34 @@ pub enum GlobalDecl {
         params: Vec<LParam>,
         body: Option<LBlock>, // if none, then this is a function declaration
     },
+    StructDef {
+        name: LIdent,
+        body: Option<Vec<LStructField>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
-    Ident(String),
+    Ident(LIdent),
     Int(i32),
     True,
     False,
+    Null,
+    Field {
+        ident: Box<LExpr>,
+        field: LIdent,
+    },
+    Deref(Box<LExpr>),
+    Index {
+        base: Box<LExpr>,
+        index: Box<LExpr>,
+    },
+    Alloc(LTyp),
+    AllocArray {
+        typ: LTyp,
+        size: Box<LExpr>,
+    },
+    LValue(LLValue),
     BinOp {
         op: LBinOp,
         lhs: Box<LExpr>,
@@ -57,8 +102,23 @@ pub enum Expr {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Assign {
-        name: LIdent,
+        name: LLValue,
         value: LExpr,
+    },
+    // we would like to elaborate x += y to x = x + y in all cases
+    // but this is wrong in cases like:
+    // arr[f(x)] += y =/= arr[f(x)] = arr[f(x)] + y
+    // instead, evaluate arr[f(x)] once to get its address, then use the address
+    // for the computation, rather than compute f(x) twice
+    CompoundAssign {
+        name: LLValue,
+        op: LAsnOp,
+        value: LExpr,
+    },
+    // similar but for x++ (x = x + 1) and x-- (x = x - 1)
+    Postfix {
+        name: LLValue,
+        op: LPostOp,
     },
     If {
         cond: LExpr,
@@ -101,11 +161,15 @@ pub struct Program(pub Vec<LGlobalDecl>);
 
 pub type LStmt = Located<Stmt>;
 pub type LIdent = Located<String>;
+pub type LAsnOp = Located<AsnOp>;
 pub type LTyp = Located<Typ>;
 pub type LBinOp = Located<BinOp>;
 pub type LExpr = Located<Expr>;
 pub type LBlock = Located<Block>;
 pub type LParam = Located<Param>;
+pub type LPostOp = Located<PostOp>;
+pub type LStructField = Located<StructField>;
+pub type LLValue = Located<LValue>;
 pub type LGlobalDecl = Located<GlobalDecl>;
 pub type LProgram = Located<Program>;
 
@@ -131,7 +195,10 @@ impl Pretty for Typ {
             Typ::Int => "int".to_string(),
             Typ::Bool => "bool".to_string(),
             Typ::Void => "void".to_string(),
-            Typ::Named(typ) => typ.to_string(),
+            Typ::Alias(typ) => typ.to_string(),
+            Typ::Struct(typ) => format!("struct {typ}"),
+            Typ::Pointer(typ) => format!("{}*", typ.pretty(0)),
+            Typ::Array(typ) => format!("{}[]", typ.pretty(0)),
         }
     }
 }
@@ -141,6 +208,10 @@ impl Pretty for Stmt {
             Stmt::Assign { name, value } => {
                 format!("(assign {} {})", name, value.data.pretty(indent))
             }
+            Stmt::CompoundAssign { name, op, value } => {
+                format!("({} {} {})", op, name, value.data.pretty(indent))
+            }
+            Stmt::Postfix { name, op } => format!("({} {})", op, name),
             Stmt::If {
                 cond,
                 true_block,
@@ -237,6 +308,16 @@ impl Pretty for GlobalDecl {
                 s.push_str(")");
                 s
             }
+            GlobalDecl::StructDef { name, body } => {
+                let mut s = String::new();
+                write!(s, "(struct {} [", name).unwrap();
+                if let Some(body) = body {
+                    let fields: String = body.iter().map(|sf| sf.pretty(0)).join("; ");
+                    write!(s, "{}", fields).unwrap();
+                }
+                s.push_str("])");
+                s
+            }
         }
     }
 }
@@ -270,6 +351,7 @@ impl Pretty for Expr {
             Expr::Int(value) => value.to_string(),
             Expr::True => "true".to_string(),
             Expr::False => "false".to_string(),
+            Expr::Null => "null".to_string(),
             Expr::BinOp { op, lhs, rhs } => {
                 let mut s = String::new();
                 write!(
@@ -308,8 +390,57 @@ impl Pretty for Expr {
                 s.push_str(")");
                 s
             }
+            Expr::Field { ident, field } => {
+                let mut s = String::new();
+                write!(s, "(field-access {} {})", ident, field).unwrap();
+                s
+            }
+            Expr::Deref(expr) => format!("(deref {})", expr.data.pretty(indent)),
+            Expr::Index { base, index } => format!(
+                "(index {} {})",
+                base.data.pretty(indent),
+                index.data.pretty(indent)
+            ),
+            Expr::Alloc(typ) => format!("(alloc {})", typ.pretty(indent)),
+            Expr::AllocArray { typ, size } => format!(
+                "(alloc-array {} {})",
+                typ.pretty(indent),
+                size.data.pretty(indent)
+            ),
+            Expr::LValue(value) => format!("(LValue {})", value),
         }
     }
 }
 
-crate::impl_display_from_pretty!(Block, Typ, Stmt, GlobalDecl, Param, Program, Expr);
+impl Pretty for LValue {
+    fn pretty(&self, indent: usize) -> String {
+        match self {
+            LValue::Ident(name) => name.data.clone(),
+            LValue::Field { base, field } => {
+                format!("(field-access {} {})", base.pretty(indent), field)
+            }
+            LValue::Deref(value) => format!("(deref {})", value.pretty(indent)),
+            LValue::Index { base, index } => format!(
+                "(index {} {})",
+                base.pretty(indent),
+                index.data.pretty(indent)
+            ),
+        }
+    }
+}
+impl Pretty for StructField {
+    fn pretty(&self, indent: usize) -> String {
+        format!("{} {}", self.typ.pretty(indent), self.name)
+    }
+}
+crate::impl_display_from_pretty!(
+    Block,
+    Typ,
+    Stmt,
+    GlobalDecl,
+    Param,
+    Program,
+    Expr,
+    StructField,
+    LValue
+);

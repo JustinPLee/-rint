@@ -7,10 +7,12 @@ pub struct Temp(pub i32);
 #[derive(Debug, Default)]
 pub struct TempGen(i32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Label(pub usize);
+pub struct Label(pub i32);
 
 #[derive(Debug, Default)]
-pub struct LabelGen(usize);
+pub struct LabelGen(i32);
+
+pub const LABEL_ABORT_NULL_DEREF: Label = Label(-1);
 
 impl Temp {
     pub fn new(id: i32) -> Self {
@@ -38,7 +40,11 @@ impl TempGen {
 
 impl fmt::Display for Label {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "L{}", self.0)
+        if self == &LABEL_ABORT_NULL_DEREF {
+            write!(f, ".L_null_deref_abort")
+        } else {
+            write!(f, ".L{}", self.0)
+        }
     }
 }
 

@@ -88,6 +88,27 @@ fn uses(instr: &Instr) -> HashSet<Node> {
             }
             result
         }
+        Instr::Load { address, .. } => to_node(address).into_iter().collect(),
+        Instr::Store { address, src, .. } => {
+            let mut result = HashSet::new();
+            if let Some(node) = to_node(address) {
+                result.insert(node);
+            }
+            if let Some(node) = to_node(src) {
+                result.insert(node);
+            }
+            result
+        }
+        Instr::Address { base, index, .. } => {
+            let mut result = HashSet::new();
+            if let Some(node) = to_node(base) {
+                result.insert(node);
+            }
+            if let Some(index) = index.as_ref().and_then(to_node) {
+                result.insert(index);
+            }
+            result
+        }
         Instr::Call { arg_count, .. } => (0..*arg_count)
             .map(|index| Node::FunctionSlot(FunctionSlot::Arg(index)))
             .collect(),
@@ -115,6 +136,9 @@ fn uses(instr: &Instr) -> HashSet<Node> {
 fn defs(instr: &Instr) -> HashSet<Node> {
     match instr {
         Instr::Move { dest, .. } => to_node(dest).into_iter().collect(),
+        Instr::Load { dest, .. } | Instr::Address { dest, .. } => {
+            to_node(dest).into_iter().collect()
+        }
         Instr::BinOp { dest, op, .. } => {
             let mut result: HashSet<Node> = to_node(dest).into_iter().collect();
             if matches!(op.data, PseudoOp::Div | PseudoOp::Mod) {
@@ -132,6 +156,7 @@ fn defs(instr: &Instr) -> HashSet<Node> {
         Instr::Pop(register) => HashSet::from([Node::from_register(*register)]),
         Instr::Jump(_)
         | Instr::Abort
+        | Instr::Store { .. }
         | Instr::CJump { .. }
         | Instr::Return
         | Instr::Label(_)
@@ -335,6 +360,7 @@ impl fmt::Display for InterferenceGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir_linear::ValueWidth;
     use crate::ir_linear::{LPseudoOp, PseudoOp};
     use crate::location::{Location, loc};
 
@@ -356,6 +382,7 @@ mod tests {
             Instr::Move {
                 dest: operand(t0.clone()),
                 src: operand(Operand::Imm(1)),
+                width: ValueWidth::Dword,
             },
             Instr::CJump {
                 lhs: operand(t0.clone()),
@@ -363,17 +390,20 @@ mod tests {
                 rhs: operand(Operand::Imm(1)),
                 true_target: Label(0),
                 false_target: Label(2),
+                width: ValueWidth::Dword,
             },
             Instr::Label(Label(2)),
             Instr::Move {
                 dest: operand(t1.clone()),
                 src: operand(Operand::Imm(2)),
+                width: ValueWidth::Dword,
             },
             Instr::Jump(Label(1)),
             Instr::Label(Label(0)),
             Instr::Move {
                 dest: operand(t1.clone()),
                 src: operand(Operand::Imm(3)),
+                width: ValueWidth::Dword,
             },
             Instr::Jump(Label(1)),
             Instr::Label(Label(1)),
@@ -382,10 +412,12 @@ mod tests {
                 lhs: operand(t0),
                 op: pseudo_op(crate::ir_linear::PseudoOp::Add),
                 rhs: operand(t1),
+                width: ValueWidth::Dword,
             },
             Instr::Move {
                 dest: operand(Operand::FunctionSlot(FunctionSlot::ReturnValue)),
                 src: operand(t2),
+                width: ValueWidth::Dword,
             },
             Instr::Return,
         ]

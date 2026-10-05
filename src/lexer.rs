@@ -97,11 +97,11 @@ impl<'a> Lexer<'a> {
         self.input.get(self.end_cursor.pos).map(|&b| b as char)
     }
 
-    fn peek_next(&self) -> Option<char> {
+    fn peek2(&self) -> Option<char> {
         self.input.get(self.end_cursor.pos + 1).map(|&b| b as char)
     }
 
-    fn peek_next_next(&self) -> Option<char> {
+    fn peek3(&self) -> Option<char> {
         self.input.get(self.end_cursor.pos + 2).map(|&b| b as char)
     }
 
@@ -169,7 +169,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_number(&mut self) -> Result<Located<Token>, LexError> {
         // hex: 0[xX]...
-        if self.peek() == Some('0') && matches!(self.peek_next(), Some('x' | 'X')) {
+        if self.peek() == Some('0') && matches!(self.peek2(), Some('x' | 'X')) {
             // 0[xX]
             self.advance(2);
 
@@ -242,8 +242,8 @@ impl<'a> Lexer<'a> {
 
         let token = match c {
             '+' => self.lex_three(Token::Plus, '+', Token::DoublePlus, '=', Token::PlusEq),
-            '-' => self.lex_three(Token::Minus, '-', Token::DoubleMinus, '=', Token::MinusEq),
-            '*' => self.lex_two(Token::Times, '=', Token::TimesEq),
+            '-' => self.lex_minus(),
+            '*' => self.lex_two(Token::Star, '=', Token::StarEq),
             '%' => self.lex_two(Token::Mod, '=', Token::ModEq),
             '=' => self.lex_two(Token::Eq, '=', Token::EqualEq),
             '!' => self.lex_two(Token::Exclam, '=', Token::NotEq),
@@ -268,10 +268,13 @@ impl<'a> Lexer<'a> {
             ')' => self.lex_one(Token::RParen),
             '{' => self.lex_one(Token::LBrace),
             '}' => self.lex_one(Token::RBrace),
+            '[' => self.lex_one(Token::LBracket),
+            ']' => self.lex_one(Token::RBracket),
             ';' => self.lex_one(Token::Semicolon),
             ':' => self.lex_one(Token::Colon),
             '?' => self.lex_one(Token::Question),
             ',' => self.lex_one(Token::Comma),
+            '.' => self.lex_one(Token::Dot),
             '/' => return self.lex_slash(), // special handling for comments
             _ => {
                 self.next();
@@ -287,10 +290,18 @@ impl<'a> Lexer<'a> {
         self.add_location(token)
     }
 
+    fn lex_minus(&mut self) -> Located<Token> {
+        if self.peek2() == Some('>') {
+            self.lex_two(Token::Minus, '>', Token::Arrow)
+        } else {
+            self.lex_three(Token::Minus, '-', Token::DoubleMinus, '=', Token::MinusEq)
+        }
+    }
+
     /// if current char is `one` and next char is `next`, lex `two`
     /// otherwise, lex `one`
     fn lex_two(&mut self, one: Token, next: char, two: Token) -> Located<Token> {
-        if self.peek_next() == Some(next) {
+        if self.peek2() == Some(next) {
             self.advance(2);
             self.add_location(two)
         } else {
@@ -310,7 +321,7 @@ impl<'a> Lexer<'a> {
         two: char,
         two_token: Token,
     ) -> Located<Token> {
-        match self.peek_next() {
+        match self.peek2() {
             Some(c) if c == one => {
                 self.advance(2);
                 self.add_location(one_token)
@@ -334,7 +345,7 @@ impl<'a> Lexer<'a> {
         shift: Token,
         shift_assign: Token,
     ) -> Located<Token> {
-        match (self.peek_next(), self.peek_next_next()) {
+        match (self.peek2(), self.peek3()) {
             (Some(c), Some('=')) if c == shift_char => {
                 self.advance(3);
                 self.add_location(shift_assign)
@@ -355,7 +366,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_slash(&mut self) -> Result<Located<Token>, LexError> {
-        match self.peek_next() {
+        match self.peek2() {
             Some('/') => {
                 self.skip_line_comment();
                 self.lex_token()
@@ -421,7 +432,7 @@ impl<'a> Lexer<'a> {
         self.advance(2); // /*
 
         while let Some(c) = self.peek() {
-            if c == '*' && self.peek_next() == Some('/') {
+            if c == '*' && self.peek2() == Some('/') {
                 self.skip(2); // */
                 return Ok(());
             }

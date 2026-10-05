@@ -4,15 +4,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::analysis::{AnalysisError, AnalysisErrorKind};
-use crate::ast::Typ;
 use crate::ir_function::{
     Function, FunctionSlot, Instr, LInstr, LOperand, Module, Operand, Program,
 };
 use crate::location::{Location, loc};
-use crate::utils::Label;
+use crate::utils::{LABEL_ABORT_NULL_DEREF, Label};
 
 pub type BlockId = usize; // for cyclic references
-const ENTRY_LABEL: Label = Label(usize::MAX); // sentinel label 
+const ENTRY_LABEL: Label = Label(i32::MAX); // sentinel label
 
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -59,7 +58,7 @@ fn operands_with_names(oper: &LOperand) -> Option<LOperand> {
 impl Instr {
     fn use_def(&self) -> (Vec<LOperand>, Vec<Operand>) {
         match self {
-            Instr::Move { dest, src } => {
+            Instr::Move { dest, src, .. } => {
                 let uses = operands_with_names(src).into_iter().collect();
                 let defs = operands_with_names(dest)
                     .into_iter()
@@ -77,12 +76,38 @@ impl Instr {
                     .collect();
                 (uses, defs)
             }
+            Instr::Load { dest, address, .. } => {
+                let uses = operands_with_names(address).into_iter().collect();
+                let defs = operands_with_names(dest)
+                    .into_iter()
+                    .map(|op| op.data)
+                    .collect();
+                (uses, defs)
+            }
+            Instr::Store { address, src, .. } => {
+                let mut uses: Vec<LOperand> = operands_with_names(address).into_iter().collect();
+                uses.extend(operands_with_names(src));
+                (uses, Vec::new())
+            }
+            Instr::Address {
+                dest, base, index, ..
+            } => {
+                let mut uses: Vec<LOperand> = operands_with_names(base).into_iter().collect();
+                if let Some(index) = index {
+                    uses.extend(operands_with_names(index));
+                }
+                let defs = operands_with_names(dest)
+                    .into_iter()
+                    .map(|op| op.data)
+                    .collect();
+                (uses, defs)
+            }
             Instr::Call { arg_count, .. } => {
                 let uses = (0..*arg_count)
                     .map(|index| {
                         loc(
                             Operand::FunctionSlot(FunctionSlot::Arg(index)),
-                            Location::default(),
+                            Location::default(), // fix later
                         )
                     })
                     .collect();
@@ -176,14 +201,6 @@ fn successors(
     block_count: usize,
     label_to_block: &HashMap<Label, BlockId>,
 ) -> Vec<BlockId> {
-    if block.label == Some(ENTRY_LABEL) && block.instrs.is_empty() {
-        // the starting block fallsthrough to the next
-        if block_id + 1 < block_count {
-            return vec![block_id + 1];
-        }
-        return Vec::new();
-    }
-
     match block.instrs.last().map(|instr| &instr.data) {
         Some(Instr::Jump(target)) => vec![*label_to_block.get(target).expect("label exists")],
         Some(Instr::CJump {
@@ -196,6 +213,14 @@ fn successors(
                 .get(false_target)
                 .expect("false label exists"),
         ],
+        Some(Instr::Return | Instr::Abort) => Vec::new(),
+        // fallthrough
+        // prevent fallthrough to the abort label
+        _ if block_id + 1 < block_count
+            && label_to_block.get(&LABEL_ABORT_NULL_DEREF).copied() != Some(block_id + 1) =>
+        {
+            vec![block_id + 1]
+        }
         _ => Vec::new(),
     }
 }
@@ -255,8 +280,7 @@ impl Cfg {
     fn check_function(function: &Function) -> Result<(), AnalysisError> {
         let cfg = Self::new(&function.body);
 
-        // void returning functions don't need an explicit return statment
-        if function.ret_type.data != Typ::Void && !cfg.all_paths_return() {
+        if !cfg.all_paths_return() {
             return Err(AnalysisError::new(
                 AnalysisErrorKind::NoReturn,
                 function.name.location.clone(),
@@ -361,7 +385,6 @@ impl Cfg {
                     for pred_id in pred_ids.into_iter().skip(1) {
                         pred_outgoing = pred_outgoing
                             .intersection(&block_out[pred_id])
-                            .into_iter()
                             .cloned()
                             .collect();
                     }
@@ -455,7 +478,7 @@ impl fmt::Display for Cfg {
             };
             writeln!(f, "block {id} [{label}]")?;
             for instr in &block.instrs {
-                writeln!(f, "  {}", instr.data.to_string())?;
+                writeln!(f, "  {}", instr.data)?;
             }
             writeln!(f, "  preds: {:?}", block.preds)?;
             writeln!(f, "  succs: {:?}", block.succs)?;
@@ -475,6 +498,7 @@ impl fmt::Display for Cfg {
 mod tests {
     use super::*;
     use crate::ir_function::PseudoOp;
+    use crate::ir_linear::ValueWidth;
     use crate::location::{Located, Location};
     use crate::utils::Temp;
 
@@ -494,6 +518,7 @@ mod tests {
                 rhs: locate(Operand::Imm(1)),
                 true_target: Label(0),
                 false_target: Label(1),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Label(Label(1))),
             locate(Instr::Return),
@@ -508,6 +533,7 @@ mod tests {
                 rhs: locate(Operand::Imm(1)),
                 true_target: Label(1),
                 false_target: Label(0),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Label(Label(0))),
             locate(Instr::Return),
@@ -515,6 +541,7 @@ mod tests {
             locate(Instr::Move {
                 dest: locate(Operand::Temp(Temp::new(0))),
                 src: locate(Operand::Imm(2)),
+                width: ValueWidth::Dword,
             }),
         ]);
 
@@ -532,6 +559,7 @@ mod tests {
                 rhs: locate(Operand::Imm(1)),
                 true_target: Label(0),
                 false_target: Label(1),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Label(Label(1))),
         ]);
@@ -546,6 +574,7 @@ mod tests {
             locate(Instr::Move {
                 dest: locate(Operand::FunctionSlot(FunctionSlot::ReturnValue)),
                 src: locate(Operand::Temp(param)),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Return),
         ]);
@@ -562,6 +591,7 @@ mod tests {
             locate(Instr::Move {
                 dest: locate(Operand::Temp(Temp::new(0))),
                 src: locate(Operand::Temp(Temp::new(1))),
+                width: ValueWidth::Dword,
             }),
         ]);
         let cfg = Cfg::new(&program);
@@ -577,6 +607,7 @@ mod tests {
             locate(Instr::Move {
                 dest: locate(t0.clone()),
                 src: locate(Operand::Imm(1)),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::CJump {
                 lhs: locate(t0.clone()),
@@ -584,23 +615,27 @@ mod tests {
                 rhs: locate(Operand::Imm(1)),
                 true_target: Label(0),
                 false_target: Label(2),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Label(Label(2))),
             locate(Instr::Move {
                 dest: locate(t1.clone()),
                 src: locate(Operand::Imm(2)),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Jump(Label(1))),
             locate(Instr::Label(Label(0))),
             locate(Instr::Move {
                 dest: locate(t1.clone()),
                 src: locate(Operand::Imm(3)),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Jump(Label(1))),
             locate(Instr::Label(Label(1))),
             locate(Instr::Move {
                 dest: locate(Operand::FunctionSlot(FunctionSlot::ReturnValue)),
                 src: locate(t1),
+                width: ValueWidth::Dword,
             }),
             locate(Instr::Return),
         ]);
