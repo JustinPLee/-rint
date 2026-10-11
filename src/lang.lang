@@ -1,50 +1,14 @@
-struct Node {
-    int value;
-    struct Node* next;
+struct B {
+  int x;
 };
 
-typedef struct Node Node;
-
-Node* reverse_list(Node* head) {
-    Node* previous = null;
-    Node* current = head;
-
-    while (current != null) {
-        Node* next = current->next;
-        current->next = previous;
-        previous = current;
-        current = next;
-    }
-
-    return previous;
-}
+typedef struct B B;
 
 int main() {
-    Node* first = alloc(Node);
-    Node* second = alloc(Node);
-    Node* third = alloc(Node);
-
-    first->value = 1;
-    first->next = second;
-    second->value = 2;
-    second->next = third;
-    third->value = 3;
-    third->next = null;
-
-    Node* reversed = reverse_list(first);
-
-    if (reversed->value != 3) {
-        return 1;
-    }
-    if (reversed->next->value != 2) {
-        return 1;
-    }
-    if (reversed->next->next->value != 1) {
-        return 1;
-    }
-    if (reversed->next->next->next != null) {
-        return 1;
-    }
-
-    return 9;
+  int[] a = alloc_array(int, 2);
+  a[2] = 2;
+  B*[] bs = alloc_array(B*, 10);
+  bs[0] = alloc(B);
+  bs[0]->x = 2;
+  return bs[0]->x;
 }

@@ -299,13 +299,14 @@ fn assigning_incompatible_pointer_types_is_rejected() {
 }
 
 #[test]
-fn pointer_to_array_is_rejected_until_arrays_are_supported() {
+fn arrays_can_be_declared_as_variables() {
     let source = r#"
     int main() {
-        int[] values;
-        return 0;
+        int[] values = alloc_array(int, 3);
+        values[0] = 42;
+        return values[0];
     }
     "#;
 
-    assert_analysis_error(source, AnalysisErrorKind::ArraysNotImplemented);
+    assert_eq!(run(source), 42);
 }

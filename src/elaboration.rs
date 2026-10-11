@@ -65,6 +65,7 @@ fn elaborate_expr(expr: CLExpr) -> LExpr {
             typ: elaborate_typ(typ),
             size: Box::new(elaborate_expr(*size)),
         },
+        CExpr::ArrayLength(array) => Expr::ArrayLength(Box::new(elaborate_expr(*array))),
     };
 
     loc(data, location)

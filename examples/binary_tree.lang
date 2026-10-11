@@ -1,0 +1,29 @@
+// Recursive structs use pointers for their children.
+struct Node {
+    int value;
+    struct Node* left;
+    struct Node* right;
+};
+
+int sum_tree(struct Node* node) {
+    if (node == null) {
+        return 0;
+    }
+    return node->value + sum_tree(node->left) + sum_tree(node->right);
+}
+
+int main() {
+    struct Node* root = alloc(struct Node);
+    root->left = alloc(struct Node);
+    root->right = alloc(struct Node);
+    root->left->left = alloc(struct Node);
+
+    root->value = 10;
+    root->left->value = 7;
+    root->right->value = 20;
+    root->left->left->value = 5;
+
+    assert(sum_tree(root) == 42);
+    assert(sum_tree(null) == 0);
+    return sum_tree(root);
+}

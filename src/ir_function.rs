@@ -399,12 +399,12 @@ impl fmt::Display for Instr {
                 dest,
                 address,
                 width,
-            } => write!(f, "{dest} ← load({width:?}) {address}"),
+            } => write!(f, "{dest} ← load[{width:?}]({address})"),
             Self::Store {
                 address,
                 src,
                 width,
-            } => write!(f, "store({width:?}) {address} ← {src}"),
+            } => write!(f, "store[{width:?}]({address}, {src})"),
             Self::Address {
                 dest,
                 base,

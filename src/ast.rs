@@ -82,6 +82,7 @@ pub enum Expr {
         typ: LTyp,
         size: Box<LExpr>,
     },
+    ArrayLength(Box<LExpr>),
     LValue(LLValue),
     BinOp {
         op: LBinOp,
@@ -407,6 +408,7 @@ impl Pretty for Expr {
                 typ.pretty(indent),
                 size.data.pretty(indent)
             ),
+            Expr::ArrayLength(array) => format!("(length_array {})", array.data.pretty(indent)),
             Expr::LValue(value) => format!("(LValue {})", value),
         }
     }

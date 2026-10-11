@@ -919,6 +919,15 @@ impl Parser {
                     self.start_to_last(start),
                 ))
             }
+            Token::LengthArray => {
+                self.try_consume(&Token::LParen)?;
+                let array = self.parse_expr()?;
+                self.try_consume(&Token::RParen)?;
+                Ok(loc(
+                    Expr::ArrayLength(Box::new(array)),
+                    self.start_to_last(start),
+                ))
+            }
             Token::Ident(name) if self.peek() == Some(&Token::LParen) => {
                 self.parse_call(loc(name, start))
             }

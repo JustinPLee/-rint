@@ -159,7 +159,7 @@ enum Place {
 
 fn type_width(typ: &RType) -> ValueWidth {
     match typ {
-        RType::Pointer(_) | RType::Null => ValueWidth::Qword,
+        RType::Pointer(_) | RType::Array(_) | RType::Null | RType::Struct(_) => ValueWidth::Qword,
         _ => ValueWidth::Dword,
     }
 }
@@ -195,6 +195,63 @@ impl<'a> Ctx<'a> {
             location.clone(),
         );
         self.push(Instr::Label(ok), location);
+    }
+
+    fn checked_array_address(
+        &mut self,
+        array: LOperand,
+        index: LOperand,
+        element: &RType,
+        location: Location,
+    ) -> LOperand {
+        self.check_null_ptr(&array, location.clone());
+        let length = self.tempgen.fresh();
+        self.push(
+            Instr::Load {
+                dest: loc(Operand::Temp(length), location.clone()),
+                address: array.clone(),
+                width: ValueWidth::Dword,
+            },
+            location.clone(),
+        );
+        let nonnegative = self.labelgen.fresh();
+        self.push(
+            Instr::CJump {
+                lhs: index.clone(),
+                op: loc(PseudoOp::GreaterEq, location.clone()),
+                rhs: loc(Operand::Imm(0), location.clone()),
+                true_target: nonnegative,
+                false_target: LABEL_ABORT_NULL_DEREF,
+                width: ValueWidth::Dword,
+            },
+            location.clone(),
+        );
+        self.push(Instr::Label(nonnegative), location.clone());
+        let in_bounds = self.labelgen.fresh();
+        self.push(
+            Instr::CJump {
+                lhs: index.clone(),
+                op: loc(PseudoOp::Less, location.clone()),
+                rhs: loc(Operand::Temp(length), location.clone()),
+                true_target: in_bounds,
+                false_target: LABEL_ABORT_NULL_DEREF,
+                width: ValueWidth::Dword,
+            },
+            location.clone(),
+        );
+        self.push(Instr::Label(in_bounds), location.clone());
+        let dest = self.tempgen.fresh();
+        self.push(
+            Instr::Address {
+                dest: loc(Operand::Temp(dest), location.clone()),
+                base: array,
+                index: Some(index),
+                scale: self.types.layout(element).0 as u8,
+                displacement: 8,
+            },
+            location.clone(),
+        );
+        loc(Operand::Temp(dest), location)
     }
 
     fn field_address(&mut self, base: LOperand, typ: &RType, field: &LIdent) -> LOperand {
@@ -235,7 +292,17 @@ impl<'a> Ctx<'a> {
                 let field_type = self.types.field_type(&typ, field).unwrap();
                 Place::Memory(field_address, field_type)
             }
-            LValue::Index { .. } => todo!(),
+            LValue::Index { base, index } => {
+                let base_place = self.trans_place(base);
+                let (array, base_type) = self.read_place(&base_place, base.location.clone());
+                let RType::Array(element) = base_type else {
+                    panic!("checked array base")
+                };
+                let index = self.trans_expr(index);
+                let address =
+                    self.checked_array_address(array, index, &element, value.location.clone());
+                Place::Memory(address, *element)
+            }
         }
     }
 
@@ -432,8 +499,111 @@ impl<'a> Ctx<'a> {
                 self.check_null_ptr(&result, source_loc);
                 result
             }
-            AstExpr::Index { .. } | AstExpr::AllocArray { .. } => {
-                todo!()
+            AstExpr::Index { base, index } => {
+                let RType::Array(element) = self.get_type(base) else {
+                    panic!("checked array base")
+                };
+                let array = self.trans_expr(base);
+                let index = self.trans_expr(index);
+                let address =
+                    self.checked_array_address(array, index, &element, source_loc.clone());
+                self.read_place(&Place::Memory(address, *element), source_loc)
+                    .0
+            }
+            AstExpr::AllocArray { typ, size } => {
+                let element = self.types.type_of(typ);
+                let element_size = self.types.layout(&element).0;
+                let length = self.trans_expr(size);
+                let valid = self.labelgen.fresh();
+                self.push(
+                    Instr::CJump {
+                        lhs: length.clone(),
+                        op: loc(PseudoOp::GreaterEq, source_loc.clone()),
+                        rhs: loc(Operand::Imm(0), source_loc.clone()),
+                        true_target: valid,
+                        false_target: LABEL_ABORT_NULL_DEREF,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(Instr::Label(valid), source_loc.clone());
+                let valid_size = self.labelgen.fresh();
+                self.push(
+                    Instr::CJump {
+                        lhs: length.clone(),
+                        op: loc(PseudoOp::LessEq, source_loc.clone()),
+                        rhs: loc(
+                            Operand::Imm((i32::MAX - 8) / element_size),
+                            source_loc.clone(),
+                        ),
+                        true_target: valid_size,
+                        false_target: LABEL_ABORT_NULL_DEREF,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(Instr::Label(valid_size), source_loc.clone());
+                let bytes = self.tempgen.fresh();
+                self.push(
+                    Instr::BinOp {
+                        dest: loc(Operand::Temp(bytes), source_loc.clone()),
+                        lhs: length.clone(),
+                        op: loc(PseudoOp::Mul, source_loc.clone()),
+                        rhs: loc(Operand::Imm(element_size), source_loc.clone()),
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                let total = self.tempgen.fresh();
+                self.push(
+                    Instr::BinOp {
+                        dest: loc(Operand::Temp(total), source_loc.clone()),
+                        lhs: loc(Operand::Temp(bytes), source_loc.clone()),
+                        op: loc(PseudoOp::Add, source_loc.clone()),
+                        rhs: loc(Operand::Imm(8), source_loc.clone()),
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::Call {
+                        dest: Some(dest),
+                        dest_width: Some(ValueWidth::Qword),
+                        callee: loc("calloc".to_string(), source_loc.clone()),
+                        args: vec![
+                            loc(Operand::Imm(1), source_loc.clone()),
+                            loc(Operand::Temp(total), source_loc.clone()),
+                        ],
+                        arg_widths: vec![ValueWidth::Qword, ValueWidth::Qword],
+                    },
+                    source_loc.clone(),
+                );
+                let array = loc(Operand::Temp(dest), source_loc.clone());
+                self.check_null_ptr(&array, source_loc.clone());
+                self.push(
+                    Instr::Store {
+                        address: array.clone(),
+                        src: length,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc,
+                );
+                array
+            }
+            AstExpr::ArrayLength(array) => {
+                let address = self.trans_expr(array);
+                self.check_null_ptr(&address, source_loc.clone());
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::Load {
+                        dest: loc(Operand::Temp(dest), source_loc.clone()),
+                        address,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                loc(Operand::Temp(dest), source_loc)
             }
             AstExpr::BinOp { op, lhs, rhs } => {
                 // evaluate left to right
@@ -996,14 +1166,14 @@ impl fmt::Display for Instr {
                 address,
                 width,
             } => {
-                write!(f, "{dest} ← load({width:?}) {address}")
+                write!(f, "{dest} ← load[{width:?}]({address})")
             }
             Instr::Store {
                 address,
                 src,
                 width,
             } => {
-                write!(f, "store({width:?}) {address} ← {src}")
+                write!(f, "store[{width:?}]({address}, {src})")
             }
             Instr::Address {
                 dest,

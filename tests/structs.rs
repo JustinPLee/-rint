@@ -4,6 +4,26 @@ use helpers::{assert_analysis_error, run};
 use rint::analysis::AnalysisErrorKind;
 
 #[test]
+fn struct_equality_uses_address() {
+    let source = r#"
+    struct Item { int value; };
+
+    int main() {
+        struct Item* first = alloc(struct Item);
+        struct Item* alias = first;
+        struct Item* other = alloc(struct Item);
+        first->value = 42;
+        other->value = 42;
+        if (!(*first == *alias) || *first != *alias) { return 1; }
+        if (*first == *other || !(*first != *other)) { return 2; }
+        return 0;
+    }
+    "#;
+
+    assert_eq!(run(source), 0);
+}
+
+#[test]
 fn allocated_struct_fields_are_zeroed_and_addressable() {
     let source = r#"
     struct Point {
@@ -245,11 +265,16 @@ fn struct_values_cannot_be_declared_by_value() {
 }
 
 #[test]
-fn array_fields_are_rejected_until_arrays_are_supported() {
+fn array_fields_store_array_references() {
     let source = r#"
     struct Item { int[] values; };
-    int main() { return 0; }
+    int main() {
+        struct Item* item = alloc(struct Item);
+        item->values = alloc_array(int, 2);
+        item->values[1] = 42;
+        return item->values[1];
+    }
     "#;
 
-    assert_analysis_error(source, AnalysisErrorKind::ArraysNotImplemented);
+    assert_eq!(run(source), 42);
 }

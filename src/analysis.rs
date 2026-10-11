@@ -53,7 +53,8 @@ pub enum AnalysisErrorKind {
     StructValueNotAllowed,
 
     DereferenceNonPointer,
-    ArraysNotImplemented,
+    IndexNonArray,
+    LengthNonArray,
 
     MainMissing,
     MainNotDefined,
@@ -84,6 +85,7 @@ pub enum RType {
     Null,
     Struct(String),
     Pointer(Box<RType>),
+    Array(Box<RType>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,10 +322,21 @@ fn tc_lvalue(value: &LLValue, env: &Env) -> Result<RType, AnalysisError> {
                 pointer.location.clone(),
             )),
         },
-        LValue::Index { .. } => Err(AnalysisError::new(
-            AnalysisErrorKind::ArraysNotImplemented,
-            value.location.clone(),
-        )),
+        LValue::Index { base, index } => {
+            let base_type = tc_lvalue(base, env)?;
+            require_type(
+                &tc_value_expr(index, env)?,
+                &RType::Int,
+                index.location.clone(),
+            )?;
+            match base_type {
+                RType::Array(element) => Ok(*element),
+                _ => Err(AnalysisError::new(
+                    AnalysisErrorKind::IndexNonArray,
+                    base.location.clone(),
+                )),
+            }
+        }
     }
 }
 
@@ -395,10 +408,44 @@ pub fn tc_expr(expr: &LExpr, env: &Env) -> Result<RType, AnalysisError> {
             env.check_type_is_defined(&allocated_type, typ.location.clone())?;
             Ok(RType::Pointer(Box::new(allocated_type)))
         }
-        Expr::Index { .. } | Expr::AllocArray { .. } => Err(AnalysisError::new(
-            AnalysisErrorKind::ArraysNotImplemented,
-            expr.location.clone(),
-        )),
+        Expr::Index { base, index } => {
+            let base_type = tc_value_expr(base, env)?;
+            require_type(
+                &tc_value_expr(index, env)?,
+                &RType::Int,
+                index.location.clone(),
+            )?;
+            match base_type {
+                RType::Array(element) => Ok(*element),
+                _ => Err(AnalysisError::new(
+                    AnalysisErrorKind::IndexNonArray,
+                    base.location.clone(),
+                )),
+            }
+        }
+        Expr::AllocArray { typ, size } => {
+            let element = env.resolve_non_void_type(&typ.data, typ.location.clone())?;
+            env.check_type_is_defined(&element, typ.location.clone())?;
+            if matches!(element, RType::Struct(_)) {
+                return Err(AnalysisError::new(
+                    AnalysisErrorKind::StructValueNotAllowed,
+                    typ.location.clone(),
+                ));
+            }
+            require_type(
+                &tc_value_expr(size, env)?,
+                &RType::Int,
+                size.location.clone(),
+            )?;
+            Ok(RType::Array(Box::new(element)))
+        }
+        Expr::ArrayLength(array) => match tc_value_expr(array, env)? {
+            RType::Array(_) => Ok(RType::Int),
+            _ => Err(AnalysisError::new(
+                AnalysisErrorKind::LengthNonArray,
+                array.location.clone(),
+            )),
+        },
         Expr::BinOp { op, lhs, rhs } => tc_binop(op, lhs, rhs, env),
         Expr::TernOp {
             cond,
@@ -462,13 +509,6 @@ fn tc_binop(op: &LBinOp, lhs: &LExpr, rhs: &LExpr, env: &Env) -> Result<RType, A
             Ok(RType::Bool)
         }
         BinOp::EqualEq | BinOp::NotEq => {
-            // struct comparison is not implemented yet
-            if matches!(&lhs_type, RType::Struct(_)) || matches!(&rhs_type, RType::Struct(_)) {
-                return Err(AnalysisError::new(
-                    AnalysisErrorKind::StructValueNotAllowed,
-                    lhs.location.clone(),
-                ));
-            }
             require_type(&lhs_type, &rhs_type, rhs.location.clone())?;
             Ok(RType::Bool)
         }
@@ -674,7 +714,9 @@ fn types_are_comparable_eq(a: &RType, b: &RType) -> bool {
         // null pointers can be any type of pointer
         (RType::Null, RType::Null)
         | (RType::Null, RType::Pointer(_))
-        | (RType::Pointer(_), RType::Null) => true,
+        | (RType::Pointer(_), RType::Null)
+        | (RType::Null, RType::Array(_))
+        | (RType::Array(_), RType::Null) => true,
         _ => a == b,
     }
 }
@@ -686,6 +728,8 @@ fn least_common_parent_type(a: &RType, b: &RType) -> Option<RType> {
         match (a, b) {
             (RType::Null, RType::Pointer(_)) => Some(b.clone()),
             (RType::Pointer(_), RType::Null) => Some(a.clone()),
+            (RType::Null, RType::Array(_)) => Some(b.clone()),
+            (RType::Array(_), RType::Null) => Some(a.clone()),
             _ => None,
         }
     }
@@ -748,9 +792,8 @@ impl AnalysisError {
             AnalysisErrorKind::UndefinedStruct => "struct is undefined",
             AnalysisErrorKind::DereferenceNonPointer => "cannot dereference a non-pointer value",
             AnalysisErrorKind::StructValueNotAllowed => "struct values cannot be copied by value",
-            AnalysisErrorKind::ArraysNotImplemented => {
-                "arrays are not supported by semantic analysis yet"
-            }
+            AnalysisErrorKind::IndexNonArray => "indexing requires an array",
+            AnalysisErrorKind::LengthNonArray => "length_array requires an array",
         };
 
         Self {
@@ -806,7 +849,7 @@ impl Env {
     pub fn layout(&self, typ: &RType) -> (i32, i32) {
         match typ {
             RType::Bool | RType::Int => (4, 4),
-            RType::Pointer(_) | RType::Null => (8, 8),
+            RType::Pointer(_) | RType::Array(_) | RType::Null => (8, 8),
             RType::Struct(name) => {
                 let sinfo = self.structs.get(name).unwrap();
                 (sinfo.size, sinfo.align)
@@ -942,6 +985,8 @@ impl Env {
         })
     }
 
+    /// for locations where a struct type is valid, checks that the struct type
+    /// is defined with a nonempty body
     fn check_type_is_defined(&self, typ: &RType, location: Location) -> Result<(), AnalysisError> {
         if let RType::Struct(name) = typ {
             match self.structs.get(name) {
@@ -1155,7 +1200,7 @@ impl Env {
         Ok(())
     }
 
-    /// Resolve aliases recursively and remove source locations from the semantic type.
+    /// Resolve aliases recursively and remove source locations from the type
     fn resolve_type(&self, typ: &Typ, location: Location) -> Result<RType, AnalysisError> {
         match typ {
             Typ::Int => Ok(RType::Int),
@@ -1175,10 +1220,17 @@ impl Env {
                 let inner = self.resolve_type(&pointee.data, pointee.location.clone())?;
                 Ok(RType::Pointer(Box::new(inner)))
             }
-            Typ::Array(_) => Err(AnalysisError::new(
-                AnalysisErrorKind::ArraysNotImplemented,
-                location,
-            )),
+            Typ::Array(element) => {
+                let element =
+                    self.resolve_non_void_type(&element.data, element.location.clone())?;
+                if matches!(element, RType::Struct(_)) {
+                    return Err(AnalysisError::new(
+                        AnalysisErrorKind::StructValueNotAllowed,
+                        location,
+                    ));
+                }
+                Ok(RType::Array(Box::new(element)))
+            }
         }
     }
 

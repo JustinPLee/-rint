@@ -84,6 +84,7 @@ pub enum Expr {
         typ: LTyp,
         size: Box<LExpr>,
     },
+    ArrayLength(Box<LExpr>),
     UnOp {
         op: LUnOp,
         oper: Box<LExpr>,
@@ -414,6 +415,7 @@ impl Pretty for Expr {
                 typ.pretty(indent),
                 size.data.pretty(indent)
             ),
+            Expr::ArrayLength(array) => format!("(length_array {})", array.data.pretty(indent)),
         }
     }
 }

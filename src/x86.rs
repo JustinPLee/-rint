@@ -322,31 +322,42 @@ fn resolve_incoming_arg(index: usize) -> X86Operand {
     }
 }
 
-// reconfigure invalid mem to mem operations
-fn normalize_move(dest: X86Operand, src: X86Operand, width: Width) -> Vec<Instr> {
-    // remove useless self moves
-    if dest == src {
-        return Vec::new();
+struct Emitter<'a> {
+    instrs: Vec<Instr>,
+    allocation: &'a Allocation,
+    frame: ActivationRecord,
+    epilogue_label: Label,
+}
+
+impl Emitter<'_> {
+    fn push(&mut self, instr: Instr) {
+        self.instrs.push(instr);
     }
 
-    match (dest, src) {
-        // change mem to mem moves
-        (X86Operand::Mem(dst), X86Operand::Mem(src)) => {
-            vec![
-                Instr::Mov {
+    // reconfigure invalid mem to mem operations
+    fn normalize_move(&mut self, dest: X86Operand, src: X86Operand, width: Width) {
+        // remove useless self moves
+        if dest == src {
+            return;
+        }
+
+        match (dest, src) {
+            // change mem to mem moves
+            (X86Operand::Mem(dst), X86Operand::Mem(src)) => {
+                self.push(Instr::Mov {
                     width,
                     dest: X86Operand::Reg(SCRATCH),
                     src: X86Operand::Mem(src),
-                },
-                Instr::Mov {
+                });
+                self.push(Instr::Mov {
                     width,
                     dest: X86Operand::Mem(dst),
                     src: X86Operand::Reg(SCRATCH),
-                },
-            ]
-        }
-        (dest, src) => {
-            vec![Instr::Mov { width, dest, src }]
+                });
+            }
+            (dest, src) => {
+                self.push(Instr::Mov { width, dest, src });
+            }
         }
     }
 }
@@ -362,157 +373,150 @@ fn op_to_instr(op: PseudoOp, width: Width, dest: X86Operand, src: X86Operand) ->
     }
 }
 
-fn lower_basic_binop(
-    op: PseudoOp,
-    dest: X86Operand,
-    lhs: X86Operand,
-    rhs: X86Operand,
-    width: Width,
-) -> Vec<Instr> {
-    let scratch_op = X86Operand::Reg(SCRATCH);
+impl Emitter<'_> {
+    fn lower_basic_binop(
+        &mut self,
+        op: PseudoOp,
+        dest: X86Operand,
+        lhs: X86Operand,
+        rhs: X86Operand,
+        width: Width,
+    ) {
+        let scratch_op = X86Operand::Reg(SCRATCH);
 
-    // ex:
-    // r1 = r2 + r1
-    // mov r2, r1
-    // add r1, r1
-    // is incorrect
-    //
-    // r1 = r2 + r1
-    // mov r2, %s
-    // add r1, %s
-    // mov %s, r1
-    // is correct
-    if dest == rhs || matches!(dest, X86Operand::Mem(_)) {
-        let mut result = normalize_move(scratch_op, lhs, width);
-        result.push(op_to_instr(op, width, scratch_op, rhs));
-        result.extend(normalize_move(dest, scratch_op, width));
-        result
-    } else {
-        let mut result = normalize_move(dest, lhs, width);
-        result.push(op_to_instr(op, width, dest, rhs));
-        result
-    }
-}
-
-fn lower_binop_width(
-    op: PseudoOp,
-    dest: X86Operand,
-    lhs: X86Operand,
-    rhs: X86Operand,
-    width: Width,
-) -> Vec<Instr> {
-    match op {
-        PseudoOp::Add
-        | PseudoOp::Sub
-        | PseudoOp::And
-        | PseudoOp::Or
-        | PseudoOp::BitAnd
-        | PseudoOp::BitOr
-        | PseudoOp::BitXor => lower_basic_binop(op, dest, lhs, rhs, width),
-        PseudoOp::Mul => lower_mul(dest, lhs, rhs, width),
-        PseudoOp::Div | PseudoOp::Mod => lower_div_mod(op, dest, lhs, rhs, width),
-        PseudoOp::Less
-        | PseudoOp::LessEq
-        | PseudoOp::Greater
-        | PseudoOp::GreaterEq
-        | PseudoOp::EqualEq
-        | PseudoOp::NotEq => comparison_op(op, dest, lhs, rhs, width),
-    }
-}
-
-fn lower_mul(dest: X86Operand, lhs: X86Operand, rhs: X86Operand, width: Width) -> Vec<Instr> {
-    if let X86Operand::Reg(dest_reg) = dest {
-        // movq  rbx, rax
-        // imulq rcx, rax
-        // or
-        // imulq rax, rbx
-        let mut result = if dest == rhs {
-            Vec::new()
+        // ex:
+        // r1 = r2 + r1
+        // mov r2, r1
+        // add r1, r1
+        // is incorrect
+        //
+        // r1 = r2 + r1
+        // mov r2, %s
+        // add r1, %s
+        // mov %s, r1
+        // is correct
+        if dest == rhs || matches!(dest, X86Operand::Mem(_)) {
+            self.normalize_move(scratch_op, lhs, width);
+            self.push(op_to_instr(op, width, scratch_op, rhs));
+            self.normalize_move(dest, scratch_op, width);
         } else {
-            normalize_move(dest, lhs, width)
-        };
-        result.push(Instr::Imul {
-            width,
-            dest: X86Operand::Reg(dest_reg),
-            src: if dest == rhs { lhs } else { rhs },
-        });
-        result
-    } else {
-        // move lhs to scratch
-        // perform mul
-        // move scratch to dest
-        let scratch = X86Operand::Reg(SCRATCH);
-        let mut result = normalize_move(scratch, lhs, width);
-        result.push(Instr::Imul {
-            width,
-            dest: scratch,
-            src: rhs,
-        });
-        result.extend(normalize_move(dest, scratch, width));
-        result
+            self.normalize_move(dest, lhs, width);
+            self.push(op_to_instr(op, width, dest, rhs));
+        }
     }
-}
 
-fn lower_div_mod(
-    op: PseudoOp,
-    dest: X86Operand,
-    lhs: X86Operand,
-    rhs: X86Operand,
-    width: Width,
-) -> Vec<Instr> {
-    let mut result = Vec::new();
+    fn lower_binop_width(
+        &mut self,
+        op: PseudoOp,
+        dest: X86Operand,
+        lhs: X86Operand,
+        rhs: X86Operand,
+        width: Width,
+    ) {
+        match op {
+            PseudoOp::Add
+            | PseudoOp::Sub
+            | PseudoOp::And
+            | PseudoOp::Or
+            | PseudoOp::BitAnd
+            | PseudoOp::BitOr
+            | PseudoOp::BitXor => self.lower_basic_binop(op, dest, lhs, rhs, width),
+            PseudoOp::Mul => self.lower_mul(dest, lhs, rhs, width),
+            PseudoOp::Div | PseudoOp::Mod => self.lower_div_mod(op, dest, lhs, rhs, width),
+            PseudoOp::Less
+            | PseudoOp::LessEq
+            | PseudoOp::Greater
+            | PseudoOp::GreaterEq
+            | PseudoOp::EqualEq
+            | PseudoOp::NotEq => self.comparison_op(op, dest, lhs, rhs, width),
+        }
+    }
 
-    // dividend to rax
-    // divisor to scratch
-    // result in edx:eax
-    result.extend(normalize_move(X86Operand::Reg(SCRATCH), rhs, width));
-    result.extend(normalize_move(X86Operand::Reg(Register::Rax), lhs, width));
-    result.push(Instr::Cdq); // sign extend eax to edx:eax
-    result.push(Instr::Idiv {
-        width,
-        src: X86Operand::Reg(SCRATCH),
-    });
+    fn lower_mul(&mut self, dest: X86Operand, lhs: X86Operand, rhs: X86Operand, width: Width) {
+        if let X86Operand::Reg(dest_reg) = dest {
+            // movq  rbx, rax
+            // imulq rcx, rax
+            // or
+            // imulq rax, rbx
+            if dest != rhs {
+                self.normalize_move(dest, lhs, width);
+            }
+            self.push(Instr::Imul {
+                width,
+                dest: X86Operand::Reg(dest_reg),
+                src: if dest == rhs { lhs } else { rhs },
+            });
+        } else {
+            // move lhs to scratch
+            // perform mul
+            // move scratch to dest
+            let scratch = X86Operand::Reg(SCRATCH);
+            self.normalize_move(scratch, lhs, width);
+            self.push(Instr::Imul {
+                width,
+                dest: scratch,
+                src: rhs,
+            });
+            self.normalize_move(dest, scratch, width);
+        }
+    }
 
-    let result_reg = match op {
-        PseudoOp::Div => Register::Rax,
-        PseudoOp::Mod => Register::Rdx,
-        _ => panic!(),
-    };
-    result.extend(normalize_move(dest, X86Operand::Reg(result_reg), width));
-    result
-}
+    fn lower_div_mod(
+        &mut self,
+        op: PseudoOp,
+        dest: X86Operand,
+        lhs: X86Operand,
+        rhs: X86Operand,
+        width: Width,
+    ) {
+        // dividend to rax
+        // divisor to scratch
+        // result in edx:eax
+        self.normalize_move(X86Operand::Reg(SCRATCH), rhs, width);
+        self.normalize_move(X86Operand::Reg(Register::Rax), lhs, width);
+        self.push(Instr::Cdq); // sign extend eax to edx:eax
+        self.push(Instr::Idiv {
+            width,
+            src: X86Operand::Reg(SCRATCH),
+        });
 
-fn comparison_op(
-    op: PseudoOp,
-    dest: X86Operand,
-    lhs: X86Operand,
-    rhs: X86Operand,
-    width: Width,
-) -> Vec<Instr> {
-    // mov    lhs, scratch
-    // cmp    rhs, scratch
-    // set    scratch
-    // movzb  scratch, scratch // expand to full register
-    // mov    scratch, dest
-    let scratch = X86Operand::Reg(SCRATCH);
-    let mut result = Vec::new();
+        let result_reg = match op {
+            PseudoOp::Div => Register::Rax,
+            PseudoOp::Mod => Register::Rdx,
+            _ => panic!(),
+        };
+        self.normalize_move(dest, X86Operand::Reg(result_reg), width);
+    }
 
-    result.extend(normalize_move(scratch, lhs, width));
-    result.push(Instr::Cmp {
-        width,
-        lhs: rhs,
-        rhs: scratch,
-    });
+    fn comparison_op(
+        &mut self,
+        op: PseudoOp,
+        dest: X86Operand,
+        lhs: X86Operand,
+        rhs: X86Operand,
+        width: Width,
+    ) {
+        // mov    lhs, scratch
+        // cmp    rhs, scratch
+        // set    scratch
+        // movzb  scratch, scratch // expand to full register
+        // mov    scratch, dest
+        let scratch = X86Operand::Reg(SCRATCH);
+        self.normalize_move(scratch, lhs, width);
+        self.push(Instr::Cmp {
+            width,
+            lhs: rhs,
+            rhs: scratch,
+        });
 
-    let set = comparison_op_to_set(op);
-    result.push(set);
-    result.push(Instr::Movzx {
-        src: SCRATCH,
-        dest: SCRATCH,
-    });
-    result.extend(normalize_move(dest, scratch, Width::Dword));
-
-    result
+        let set = comparison_op_to_set(op);
+        self.push(set);
+        self.push(Instr::Movzx {
+            src: SCRATCH,
+            dest: SCRATCH,
+        });
+        self.normalize_move(dest, scratch, Width::Dword);
+    }
 }
 
 fn comparison_op_to_set(op: PseudoOp) -> Instr {
@@ -527,19 +531,15 @@ fn comparison_op_to_set(op: PseudoOp) -> Instr {
     }
 }
 
-fn lower_move_width(
-    dest: &Operand,
-    src: &Operand,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-    width: Width,
-) -> Vec<Instr> {
-    let dest = match dest {
-        Operand::FunctionSlot(FunctionSlot::Arg(index)) => resolve_outgoing_arg(*index),
-        operand => resolve_operand(operand, allocation, frame),
-    };
-    let src = resolve_operand(src, allocation, frame);
-    normalize_move(dest, src, width)
+impl Emitter<'_> {
+    fn lower_move_width(&mut self, dest: &Operand, src: &Operand, width: Width) {
+        let dest = match dest {
+            Operand::FunctionSlot(FunctionSlot::Arg(index)) => resolve_outgoing_arg(*index),
+            operand => resolve_operand(operand, self.allocation, &self.frame),
+        };
+        let src = resolve_operand(src, self.allocation, &self.frame);
+        self.normalize_move(dest, src, width);
+    }
 }
 
 fn value_width(width: ValueWidth) -> Width {
@@ -549,111 +549,84 @@ fn value_width(width: ValueWidth) -> Width {
     }
 }
 
-fn address_component(
-    operand: &Operand,
-    scratch: Register,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-) -> (Vec<Instr>, Register) {
-    match resolve_operand(operand, allocation, frame) {
-        X86Operand::Reg(register) => (Vec::new(), register),
-        source => (
-            normalize_move(X86Operand::Reg(scratch), source, Width::Qword),
-            scratch,
-        ),
+impl Emitter<'_> {
+    fn address_component(&mut self, operand: &Operand, scratch: Register) -> Register {
+        match resolve_operand(operand, self.allocation, &self.frame) {
+            X86Operand::Reg(register) => register,
+            source => {
+                self.normalize_move(X86Operand::Reg(scratch), source, Width::Qword);
+                scratch
+            }
+        }
     }
-}
 
-fn lower_address(
-    dest: &Operand,
-    base: &Operand,
-    index: Option<&Operand>,
-    scale: u8,
-    displacement: i32,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-) -> Vec<Instr> {
-    assert!(matches!(scale, 1 | 2 | 4 | 8), "invalid x86 address scale");
+    fn lower_address(
+        &mut self,
+        dest: &Operand,
+        base: &Operand,
+        index: Option<&Operand>,
+        scale: u8,
+        displacement: i32,
+    ) {
+        assert!(matches!(scale, 1 | 2 | 4 | 8), "invalid x86 address scale");
 
-    let (mut result, base) = address_component(base, SCRATCH, allocation, frame);
-    let index = if let Some(index) = index {
-        let (instructions, register) = address_component(index, Register::R10, allocation, frame);
-        result.extend(instructions);
-        Some(register)
-    } else {
-        None
-    };
+        let base = self.address_component(base, SCRATCH);
+        let index = if let Some(index) = index {
+            Some(self.address_component(index, Register::R10))
+        } else {
+            None
+        };
 
-    let dest_location = resolve_operand(dest, allocation, frame);
-    let (dest_register, spilled_dest) = match dest_location {
-        X86Operand::Reg(register) => (register, false),
-        X86Operand::Mem(_) => (SCRATCH, true),
-        X86Operand::Imm(_) => panic!("address destination must be a temp"),
-    };
+        let dest_location = resolve_operand(dest, self.allocation, &self.frame);
+        let (dest_register, spilled_dest) = match dest_location {
+            X86Operand::Reg(register) => (register, false),
+            X86Operand::Mem(_) => (SCRATCH, true),
+            X86Operand::Imm(_) => panic!("address destination must be a temp"),
+        };
 
-    result.push(Instr::Lea {
-        dest: dest_register,
-        src: Memory {
-            offset: displacement,
-            base,
-            index,
-            scale,
-        },
-    });
-    if spilled_dest {
-        result.extend(normalize_move(
-            dest_location,
-            X86Operand::Reg(dest_register),
-            Width::Qword,
-        ));
+        self.push(Instr::Lea {
+            dest: dest_register,
+            src: Memory {
+                offset: displacement,
+                base,
+                index,
+                scale,
+            },
+        });
+        if spilled_dest {
+            self.normalize_move(dest_location, X86Operand::Reg(dest_register), Width::Qword);
+        }
     }
-    result
-}
 
-fn lower_load(
-    dest: &Operand,
-    address: &Operand,
-    width: ValueWidth,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-) -> Vec<Instr> {
-    let width = value_width(width);
-    let address = resolve_operand(address, allocation, frame);
-    let mut result = normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
-    let source = X86Operand::Mem(Memory {
-        offset: 0,
-        base: Register::R10,
-        index: None,
-        scale: 1,
-    });
-    let dest = resolve_operand(dest, allocation, frame);
+    fn lower_load(&mut self, dest: &Operand, address: &Operand, width: ValueWidth) {
+        let width = value_width(width);
+        let address = resolve_operand(address, self.allocation, &self.frame);
+        self.normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
+        let source = X86Operand::Mem(Memory {
+            offset: 0,
+            base: Register::R10,
+            index: None,
+            scale: 1,
+        });
+        let dest = resolve_operand(dest, self.allocation, &self.frame);
 
-    result.extend(normalize_move(dest, source, width));
+        self.normalize_move(dest, source, width);
+    }
 
-    result
-}
+    fn lower_store(&mut self, address: &Operand, src: &Operand, width: ValueWidth) {
+        let width = value_width(width);
+        let address = resolve_operand(address, self.allocation, &self.frame);
+        self.normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
+        let dest = X86Operand::Mem(Memory {
+            offset: 0,
+            base: Register::R10,
+            index: None,
+            scale: 1,
+        });
+        let src = resolve_operand(src, self.allocation, &self.frame);
 
-fn lower_store(
-    address: &Operand,
-    src: &Operand,
-    width: ValueWidth,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-) -> Vec<Instr> {
-    let width = value_width(width);
-    let address = resolve_operand(address, allocation, frame);
-    let mut result = normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
-    let dest = X86Operand::Mem(Memory {
-        offset: 0,
-        base: Register::R10,
-        index: None,
-        scale: 1,
-    });
-    let src = resolve_operand(src, allocation, frame);
-
-    result.extend(normalize_move(dest, src, width));
-
-    result
+        self.normalize_move(dest, src, width);
+    }
 }
 
 fn resolve_outgoing_arg(index: usize) -> X86Operand {
@@ -669,40 +642,39 @@ fn resolve_outgoing_arg(index: usize) -> X86Operand {
     }
 }
 
-fn lower_cjump(
-    lhs: &Operand,
-    op: PseudoOp,
-    rhs: &Operand,
-    false_label: Label,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-    width: Width,
-) -> Vec<Instr> {
-    let lhs = resolve_operand(lhs, allocation, frame);
-    let rhs = resolve_operand(rhs, allocation, frame);
-    let mut result = if !matches!(lhs, X86Operand::Imm(_))
-        && !matches!((lhs, rhs), (X86Operand::Mem(_), X86Operand::Mem(_)))
-    {
-        vec![Instr::Cmp {
-            width,
-            lhs: rhs,
-            rhs: lhs,
-        }]
-    } else {
-        let mut result = normalize_move(X86Operand::Reg(SCRATCH), lhs, width);
-        result.push(Instr::Cmp {
-            width,
-            lhs: rhs,
-            rhs: X86Operand::Reg(SCRATCH),
-        });
-        result
-    };
+impl Emitter<'_> {
+    fn lower_cjump(
+        &mut self,
+        lhs: &Operand,
+        op: PseudoOp,
+        rhs: &Operand,
+        false_label: Label,
+        width: Width,
+    ) {
+        let lhs = resolve_operand(lhs, self.allocation, &self.frame);
+        let rhs = resolve_operand(rhs, self.allocation, &self.frame);
+        if !matches!(lhs, X86Operand::Imm(_))
+            && !matches!((lhs, rhs), (X86Operand::Mem(_), X86Operand::Mem(_)))
+        {
+            self.push(Instr::Cmp {
+                width,
+                lhs: rhs,
+                rhs: lhs,
+            });
+        } else {
+            self.normalize_move(X86Operand::Reg(SCRATCH), lhs, width);
+            self.push(Instr::Cmp {
+                width,
+                lhs: rhs,
+                rhs: X86Operand::Reg(SCRATCH),
+            });
+        }
 
-    // the assembly only produces one false label, no true label
-    // the true branch falls through
-    // we need to invert the comparison op to jump to the false label
-    result.push(inverse_comparison_jump(op, false_label));
-    result
+        // the assembly only produces one false label, no true label
+        // the true branch falls through
+        // we need to invert the comparison op to jump to the false label
+        self.push(inverse_comparison_jump(op, false_label));
+    }
 }
 
 fn inverse_comparison_jump(op: PseudoOp, target: Label) -> Instr {
@@ -717,116 +689,106 @@ fn inverse_comparison_jump(op: PseudoOp, target: Label) -> Instr {
     }
 }
 
-fn lower_instr(
-    instr: &IrInstr,
-    allocation: &Allocation,
-    frame: &ActivationRecord,
-    epilogue_label: Label,
-) -> Vec<Instr> {
-    match instr {
-        IrInstr::Move { dest, src, width } => lower_move_width(
-            &dest.data,
-            &src.data,
-            allocation,
-            frame,
-            value_width(*width),
-        ),
-        IrInstr::BinOp {
-            op,
-            dest,
-            lhs,
-            rhs,
-            width,
-        } => {
-            let dest = resolve_operand(&dest.data, allocation, frame);
-            let lhs = resolve_operand(&lhs.data, allocation, frame);
-            let rhs = resolve_operand(&rhs.data, allocation, frame);
-            lower_binop_width(op.data, dest, lhs, rhs, value_width(*width))
-        }
-        IrInstr::Load {
-            dest,
-            address,
-            width,
-        } => lower_load(&dest.data, &address.data, *width, allocation, frame),
-        IrInstr::Store {
-            address,
-            src,
-            width,
-        } => lower_store(&address.data, &src.data, *width, allocation, frame),
-        IrInstr::Address {
-            dest,
-            base,
-            index,
-            scale,
-            displacement,
-        } => lower_address(
-            &dest.data,
-            &base.data,
-            index.as_ref().map(|index| &index.data),
-            *scale,
-            *displacement,
-            allocation,
-            frame,
-        ),
-        IrInstr::Call { callee, .. } => vec![Instr::Call(callee.data.clone())],
-        IrInstr::Return => vec![Instr::Jmp(epilogue_label)],
-        IrInstr::Jump(label) => vec![Instr::Jmp(*label)],
-        IrInstr::CJump {
-            lhs,
-            op,
-            rhs,
-            false_target: false_label,
-            width,
-            ..
-        } => lower_cjump(
-            &lhs.data,
-            op.data,
-            &rhs.data,
-            *false_label,
-            allocation,
-            frame,
-            value_width(*width),
-        ),
-        IrInstr::Abort => vec![Instr::Call("abort".to_string())],
-        IrInstr::Label(label) => vec![Instr::Label(*label)],
-        IrInstr::Push(_) | IrInstr::Pop(_) => {
-            panic!("push/pop are only inserted by prologue/epilogue. they should not appear here")
+impl Emitter<'_> {
+    fn lower_instr(&mut self, instr: &IrInstr) {
+        match instr {
+            IrInstr::Move { dest, src, width } => {
+                self.lower_move_width(&dest.data, &src.data, value_width(*width))
+            }
+            IrInstr::BinOp {
+                op,
+                dest,
+                lhs,
+                rhs,
+                width,
+            } => {
+                let dest = resolve_operand(&dest.data, self.allocation, &self.frame);
+                let lhs = resolve_operand(&lhs.data, self.allocation, &self.frame);
+                let rhs = resolve_operand(&rhs.data, self.allocation, &self.frame);
+                self.lower_binop_width(op.data, dest, lhs, rhs, value_width(*width))
+            }
+            IrInstr::Load {
+                dest,
+                address,
+                width,
+            } => self.lower_load(&dest.data, &address.data, *width),
+            IrInstr::Store {
+                address,
+                src,
+                width,
+            } => self.lower_store(&address.data, &src.data, *width),
+            IrInstr::Address {
+                dest,
+                base,
+                index,
+                scale,
+                displacement,
+            } => self.lower_address(
+                &dest.data,
+                &base.data,
+                index.as_ref().map(|index| &index.data),
+                *scale,
+                *displacement,
+            ),
+            IrInstr::Call { callee, .. } => self.push(Instr::Call(callee.data.clone())),
+            IrInstr::Return => self.push(Instr::Jmp(self.epilogue_label)),
+            IrInstr::Jump(label) => self.push(Instr::Jmp(*label)),
+            IrInstr::CJump {
+                lhs,
+                op,
+                rhs,
+                false_target: false_label,
+                width,
+                ..
+            } => self.lower_cjump(
+                &lhs.data,
+                op.data,
+                &rhs.data,
+                *false_label,
+                value_width(*width),
+            ),
+            IrInstr::Abort => self.push(Instr::Call("abort".to_string())),
+            IrInstr::Label(label) => self.push(Instr::Label(*label)),
+            IrInstr::Push(_) | IrInstr::Pop(_) => {
+                panic!(
+                    "push/pop are only inserted by prologue/epilogue. they should not appear here"
+                )
+            }
         }
     }
 }
 
-fn emit_prologue(frame: &ActivationRecord) -> Vec<Instr> {
-    let mut result = vec![Instr::Push(Register::Rbp)];
-    result.push(Instr::Mov {
-        width: Width::Qword,
-        dest: X86Operand::Reg(Register::Rbp),
-        src: X86Operand::Reg(Register::Rsp),
-    });
+impl Emitter<'_> {
+    fn emit_prologue(&mut self) {
+        self.push(Instr::Push(Register::Rbp));
+        self.push(Instr::Mov {
+            width: Width::Qword,
+            dest: X86Operand::Reg(Register::Rbp),
+            src: X86Operand::Reg(Register::Rsp),
+        });
 
-    for &register in &frame.pushed_registers {
-        result.push(Instr::Push(register));
+        for &register in &self.frame.pushed_registers {
+            self.instrs.push(Instr::Push(register));
+        }
+
+        if self.frame.stack_size > 0 {
+            self.push(Instr::SubStack(self.frame.stack_size as i32));
+        }
     }
 
-    if frame.stack_size > 0 {
-        result.push(Instr::SubStack(frame.stack_size as i32));
+    fn emit_epilogue(&mut self) {
+        self.push(Instr::Label(self.epilogue_label));
+        if self.frame.stack_size > 0 {
+            self.push(Instr::AddStack(self.frame.stack_size as i32));
+        }
+
+        for &register in self.frame.pushed_registers.iter().rev() {
+            self.instrs.push(Instr::Pop(register));
+        }
+
+        self.push(Instr::Pop(Register::Rbp));
+        self.push(Instr::Ret);
     }
-
-    result
-}
-
-fn emit_epilogue(frame: &ActivationRecord, epilogue_label: Label) -> Vec<Instr> {
-    let mut result = vec![Instr::Label(epilogue_label)];
-    if frame.stack_size > 0 {
-        result.push(Instr::AddStack(frame.stack_size as i32));
-    }
-
-    for &register in frame.pushed_registers.iter().rev() {
-        result.push(Instr::Pop(register));
-    }
-
-    result.push(Instr::Pop(Register::Rbp));
-    result.push(Instr::Ret);
-    result
 }
 
 // convert function IR to x86
@@ -835,10 +797,13 @@ pub fn lower_instrs(
     allocation: &Allocation,
     labelgen: &mut LabelGen,
 ) -> Vec<Instr> {
-    let frame = ActivationRecord::new(allocation, instrs);
-    let epilogue_label = labelgen.fresh();
-
-    let mut result = emit_prologue(&frame);
+    let mut emitter = Emitter {
+        instrs: Vec::new(),
+        allocation,
+        frame: ActivationRecord::new(allocation, instrs),
+        epilogue_label: labelgen.fresh(),
+    };
+    emitter.emit_prologue();
 
     let mut instrs = instrs.iter().peekable();
     while let Some(instr) = instrs.next() {
@@ -851,12 +816,12 @@ pub fn lower_instrs(
             }
             continue;
         }
-        result.extend(lower_instr(instr, allocation, &frame, epilogue_label));
+        emitter.lower_instr(instr);
     }
 
-    result.extend(emit_epilogue(&frame, epilogue_label));
+    emitter.emit_epilogue();
 
-    result
+    emitter.instrs
 }
 
 fn emit_function_assembly(

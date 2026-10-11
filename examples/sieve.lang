@@ -1,0 +1,31 @@
+// Arrays are passed by reference, and length_array reads their length.
+void mark_composites(bool[] composite) {
+    for (int p = 2; p * p < length_array(composite); p++) {
+        if (!composite[p]) {
+            for (int multiple = p * p; multiple < length_array(composite); multiple += p) {
+                composite[multiple] = true;
+            }
+        }
+    }
+    return;
+}
+
+int count_primes(bool[] composite) {
+    int count = 0;
+    for (int n = 2; n < length_array(composite); n++) {
+        if (!composite[n]) {
+            count++;
+        }
+    }
+    return count;
+}
+
+int main() {
+    bool[] composite = alloc_array(bool, 31);
+    mark_composites(composite);
+
+    // There are ten primes from 2 through 30.
+    assert(count_primes(composite) == 10);
+    assert(!composite[29] && composite[30]);
+    return 10;
+}
