@@ -1,10 +1,11 @@
+// Original allocator retained for comparison.
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::ir_function::{FunctionSlot, Instr, Program, abstract_name};
+use crate::ir_function::{FunctionSlot, Instr, Program};
 use crate::liveness::{InterferenceGraph, Node, do_liveness, to_node};
 use crate::utils::Temp;
-use crate::x86::Register;
+use crate::x86::{Register, abstract_name, function_slot_register};
 
 #[derive(Clone, Copy, Debug)]
 pub enum PhysLoc {
@@ -134,7 +135,7 @@ pub fn color(
                 registers.insert(node, register);
             }
             Node::FunctionSlot(location) => {
-                if let Some(register) = location.register() {
+                if let Some(register) = function_slot_register(location) {
                     registers.insert(node, register);
                 }
             }
@@ -290,8 +291,8 @@ impl fmt::Display for Allocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir_function::{FunctionSlot, Operand, PseudoOp};
-    use crate::ir_linear::ValueWidth;
+    use crate::ir_function::{CallTarget, FunctionSlot, Operand, PseudoOp};
+    use crate::ir_function::ValueWidth;
     use crate::location::{Location, loc};
 
     #[test]
@@ -312,7 +313,7 @@ mod tests {
                 width: ValueWidth::Dword,
             },
             Instr::Call {
-                callee: loc("pow".to_string(), Location::default()),
+                callee: CallTarget::Direct(loc("pow".to_string(), Location::default())),
                 arg_count: 1,
             },
             Instr::Move {

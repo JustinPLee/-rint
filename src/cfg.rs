@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::analysis::{AnalysisError, AnalysisErrorKind};
 use crate::ir_function::{
-    Function, FunctionSlot, Instr, LInstr, LOperand, Module, Operand, Program,
+    CallTarget, Function, FunctionSlot, Instr, LInstr, LOperand, Module, Operand, Program,
 };
 use crate::location::{Location, loc};
 use crate::utils::{LABEL_ABORT_NULL_DEREF, Label};
@@ -102,8 +102,17 @@ impl Instr {
                     .collect();
                 (uses, defs)
             }
-            Instr::Call { arg_count, .. } => {
-                let uses = (0..*arg_count)
+            Instr::FunctionAddress { dest, .. } => {
+                let defs = operands_with_names(dest)
+                    .into_iter()
+                    .map(|op| op.data)
+                    .collect();
+                (Vec::new(), defs)
+            }
+            Instr::Call {
+                callee, arg_count, ..
+            } => {
+                let mut uses: Vec<LOperand> = (0..*arg_count)
                     .map(|index| {
                         loc(
                             Operand::FunctionSlot(FunctionSlot::Arg(index)),
@@ -111,6 +120,9 @@ impl Instr {
                         )
                     })
                     .collect();
+                if let CallTarget::Indirect(target) = callee {
+                    uses.extend(operands_with_names(target));
+                }
                 let defs = vec![Operand::FunctionSlot(FunctionSlot::ReturnValue)];
                 (uses, defs)
             }
@@ -119,12 +131,9 @@ impl Instr {
                 uses.extend(operands_with_names(rhs));
                 (uses, Vec::new())
             }
-            Instr::Jump(_)
-            | Instr::Label(_)
-            | Instr::Abort
-            | Instr::Push(_)
-            | Instr::Pop(_)
-            | Instr::Return => (Vec::new(), Vec::new()),
+            Instr::Jump(_) | Instr::Label(_) | Instr::Abort | Instr::Return => {
+                (Vec::new(), Vec::new())
+            }
         }
     }
 }
@@ -498,7 +507,7 @@ impl fmt::Display for Cfg {
 mod tests {
     use super::*;
     use crate::ir_function::PseudoOp;
-    use crate::ir_linear::ValueWidth;
+    use crate::ir_function::ValueWidth;
     use crate::location::{Located, Location};
     use crate::utils::Temp;
 

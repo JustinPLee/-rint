@@ -84,6 +84,7 @@ pub enum Expr {
         typ: LTyp,
         size: Box<LExpr>,
     },
+    Dealloc(Box<LExpr>),
     ArrayLength(Box<LExpr>),
     UnOp {
         op: LUnOp,
@@ -99,8 +100,8 @@ pub enum Expr {
         true_expr: Box<LExpr>,
         false_expr: Box<LExpr>,
     },
-    FunCall {
-        name: LIdent,
+    Call {
+        callee: Box<LExpr>,
         args: Vec<LExpr>,
     },
 }
@@ -150,16 +151,15 @@ pub enum Control {
 pub enum Typ {
     Int,
     Bool,
+    Void,
     Struct(LIdent),
     Alias(LIdent), // user defined types or aliases
     Pointer(Box<LTyp>),
     Array(Box<LTyp>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum RetTyp {
-    Typ(LTyp),
-    Void,
+    Function {
+        params: Vec<LTyp>,
+        ret_typ: Box<LTyp>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -204,7 +204,7 @@ pub enum GlobalDecl {
         alias: LIdent,
     },
     FunDef {
-        ret_typ: LRetTyp,
+        ret_typ: LTyp,
         name: LIdent,
         params: Vec<LParam>,
         body: Option<LBlock>, // if none, then FunDecl
@@ -246,7 +246,6 @@ pub type LControl = Located<Control>;
 pub type LStmt = Located<Stmt>;
 pub type LBlock = Located<Block>;
 pub type LParam = Located<Param>;
-pub type LRetTyp = Located<RetTyp>;
 pub type LGlobalDecl = Located<GlobalDecl>;
 pub type LStructField = Located<StructField>;
 pub type LProgram = Located<Program>;
@@ -335,10 +334,16 @@ impl Pretty for Typ {
         match self {
             Typ::Int => "int".to_string(),
             Typ::Bool => "bool".to_string(),
+            Typ::Void => "void".to_string(),
             Typ::Alias(t) => t.to_string(),
             Typ::Struct(t) => format!("struct {t}"),
             Typ::Pointer(typ) => format!("{}*", typ.pretty(0)),
             Typ::Array(typ) => format!("{}[]", typ.pretty(0)),
+            Typ::Function { params, ret_typ } => format!(
+                "fn({}) -> {}",
+                params.iter().map(|param| param.data.pretty(0)).join(", "),
+                ret_typ.data.pretty(0)
+            ),
         }
     }
 }
@@ -386,13 +391,12 @@ impl Pretty for Expr {
                 s
             }
 
-            Expr::FunCall { name, args } => {
-                let mut s = String::new();
-                write!(s, "(call {}", name).unwrap();
+            Expr::Call { callee, args } => {
+                let mut s = format!("(call {}", callee.data.pretty(indent));
                 for arg in args {
                     write!(s, " {}", arg.data.pretty(indent)).unwrap();
                 }
-                s.push_str(")");
+                s.push(')');
                 s
             }
             Expr::Field { ident, field } => {
@@ -415,7 +419,8 @@ impl Pretty for Expr {
                 typ.pretty(indent),
                 size.data.pretty(indent)
             ),
-            Expr::ArrayLength(array) => format!("(length_array {})", array.data.pretty(indent)),
+            Expr::Dealloc(value) => format!("(dealloc {})", value.data.pretty(indent)),
+            Expr::ArrayLength(array) => format!("(array_length {})", array.data.pretty(indent)),
         }
     }
 }
@@ -628,15 +633,6 @@ impl Pretty for Param {
     }
 }
 
-impl Pretty for RetTyp {
-    fn pretty(&self, indent: usize) -> String {
-        match self {
-            RetTyp::Typ(typ) => typ.pretty(indent),
-            RetTyp::Void => "void".to_string(),
-        }
-    }
-}
-
 impl Pretty for Program {
     fn pretty(&self, indent: usize) -> String {
         let mut s = String::new();
@@ -673,7 +669,6 @@ crate::impl_display_from_pretty!(
     Block,
     GlobalDecl,
     Param,
-    RetTyp,
     Program,
     StructField,
     LValue

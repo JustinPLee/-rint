@@ -1,0 +1,20 @@
+void map(int[] values, fn(int) -> int transform) {
+    for (int i = 0; i < array_length(values); i++) {
+        values[i] = transform(values[i]);
+    }
+    return;
+}
+
+int double_value(int value) {
+    return value * 2;
+}
+
+int main() {
+    int[] values = alloc_array(int, 3);
+    values[0] = 1;
+    values[1] = 2;
+    values[2] = 3;
+
+    map(values, double_value);
+    return values[2];
+}

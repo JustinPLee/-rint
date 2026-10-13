@@ -2,8 +2,10 @@
 // LATER WILL BE deconstructed ssa -> assembly
 
 use crate::allocate::{Allocation, PhysLoc, SpillSlot, allocate};
-use crate::ir_function::{Function, FunctionSlot, Instr as IrInstr, Module, Operand, PseudoOp};
-use crate::ir_linear::ValueWidth;
+use crate::ir_function::ValueWidth;
+use crate::ir_function::{
+    CallTarget, Function, FunctionSlot, Instr as IrInstr, Module, Operand, PseudoOp,
+};
 use crate::utils::{LABEL_ABORT_NULL_DEREF, Label, LabelGen};
 use core::fmt;
 
@@ -38,10 +40,39 @@ pub const ARG_REGS: [Register; 6] = [
     Register::R9,
 ];
 const SCRATCH: Register = Register::R11;
+const SCRATCH2: Register = Register::R10;
 pub const RETURN_REG: Register = Register::Rax;
 const STACK_ALIGNMENT: u32 = 16;
 const BYTES_PER_SPILL: u32 = 8;
 const BYTES_PER_REG: u32 = 8;
+
+pub fn function_slot_register(slot: FunctionSlot) -> Option<Register> {
+    match slot {
+        FunctionSlot::Arg(index) => ARG_REGS.get(index).copied(),
+        FunctionSlot::ReturnValue => Some(RETURN_REG),
+    }
+}
+
+pub fn abstract_name(register: Register) -> &'static str {
+    match register {
+        Register::Rax => "res0",
+        Register::Rdi => "arg1",
+        Register::Rsi => "arg2",
+        Register::Rdx => "arg3",
+        Register::Rcx => "arg4",
+        Register::R8 => "arg5",
+        Register::R9 => "arg6",
+        Register::R10 => "ler7",
+        Register::R11 => "ler8",
+        Register::Rbx => "lee9",
+        Register::Rbp => "lee10",
+        Register::R12 => "lee11",
+        Register::R13 => "lee12",
+        Register::R14 => "lee13",
+        Register::R15 => "lee14",
+        Register::Rsp => "rsp",
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Width {
@@ -79,7 +110,7 @@ impl Register {
     pub const DIV_REGS: [Self; 2] = [Self::Rax, Self::Rdx];
 
     // caller saved registers are near the front (will be allocated more frequently)
-    // excludes r11 (scratch register), rbp, and rsp
+    // excludes r10 and r11 (scratch registers), rbp, and rsp
     pub const AVAILABLE: &'static [Self] = &[
         Self::Rax,
         Self::Rcx,
@@ -88,7 +119,6 @@ impl Register {
         Self::Rsi,
         Self::R8,
         Self::R9,
-        Self::R10,
         Self::Rbx,
         Self::R12,
         Self::R13,
@@ -187,6 +217,10 @@ pub enum Instr {
         dest: Register,
         src: Memory,
     },
+    FunctionAddress {
+        symbol: String,
+        dest: Register,
+    },
     Add {
         width: Width,
         dest: X86Operand,
@@ -274,7 +308,8 @@ pub enum Instr {
     Comment(String),
     Directive(String),
 
-    Call(String),
+    CallDirect(String),
+    CallIndirect(X86Operand),
     Ret,
 }
 
@@ -287,7 +322,6 @@ fn resolve_operand(
 ) -> X86Operand {
     match operand {
         Operand::Imm(value) => X86Operand::Imm(*value),
-        Operand::Register(register) => X86Operand::Reg(*register),
         Operand::StackArgIndex(_) => todo!(),
         Operand::Temp(temp) => {
             let location = allocation.locations().get(temp).expect("temp is allocated");
@@ -540,6 +574,23 @@ impl Emitter<'_> {
         let src = resolve_operand(src, self.allocation, &self.frame);
         self.normalize_move(dest, src, width);
     }
+
+    fn lower_function_address(&mut self, dest: &Operand, symbol: &str) {
+        let dest = resolve_operand(dest, self.allocation, &self.frame);
+        let (register, spill_dest) = match dest {
+            X86Operand::Reg(register) => (register, None),
+            X86Operand::Mem(memory) => (SCRATCH, Some(X86Operand::Mem(memory))),
+            X86Operand::Imm(_) => panic!("function address can't write to an immediate"),
+        };
+
+        self.push(Instr::FunctionAddress {
+            symbol: symbol.to_string(),
+            dest: register,
+        });
+        if let Some(dest) = spill_dest {
+            self.normalize_move(dest, X86Operand::Reg(register), Width::Qword);
+        }
+    }
 }
 
 fn value_width(width: ValueWidth) -> Width {
@@ -571,11 +622,7 @@ impl Emitter<'_> {
         assert!(matches!(scale, 1 | 2 | 4 | 8), "invalid x86 address scale");
 
         let base = self.address_component(base, SCRATCH);
-        let index = if let Some(index) = index {
-            Some(self.address_component(index, Register::R10))
-        } else {
-            None
-        };
+        let index = index.map(|index| self.address_component(index, SCRATCH2));
 
         let dest_location = resolve_operand(dest, self.allocation, &self.frame);
         let (dest_register, spilled_dest) = match dest_location {
@@ -601,10 +648,10 @@ impl Emitter<'_> {
     fn lower_load(&mut self, dest: &Operand, address: &Operand, width: ValueWidth) {
         let width = value_width(width);
         let address = resolve_operand(address, self.allocation, &self.frame);
-        self.normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
+        self.normalize_move(X86Operand::Reg(SCRATCH2), address, Width::Qword);
         let source = X86Operand::Mem(Memory {
             offset: 0,
-            base: Register::R10,
+            base: SCRATCH2,
             index: None,
             scale: 1,
         });
@@ -616,10 +663,10 @@ impl Emitter<'_> {
     fn lower_store(&mut self, address: &Operand, src: &Operand, width: ValueWidth) {
         let width = value_width(width);
         let address = resolve_operand(address, self.allocation, &self.frame);
-        self.normalize_move(X86Operand::Reg(Register::R10), address, Width::Qword);
+        self.normalize_move(X86Operand::Reg(SCRATCH2), address, Width::Qword);
         let dest = X86Operand::Mem(Memory {
             offset: 0,
-            base: Register::R10,
+            base: SCRATCH2,
             index: None,
             scale: 1,
         });
@@ -730,7 +777,17 @@ impl Emitter<'_> {
                 *scale,
                 *displacement,
             ),
-            IrInstr::Call { callee, .. } => self.push(Instr::Call(callee.data.clone())),
+            IrInstr::FunctionAddress { dest, function } => {
+                self.lower_function_address(&dest.data, &function.data)
+            }
+            IrInstr::Call { callee, .. } => {
+                match callee {
+                    CallTarget::Direct(name) => self.push(Instr::CallDirect(name.data.clone())),
+                    CallTarget::Indirect(target) => self.push(Instr::CallIndirect(
+                        resolve_operand(&target.data, self.allocation, &self.frame),
+                    )),
+                }
+            }
             IrInstr::Return => self.push(Instr::Jmp(self.epilogue_label)),
             IrInstr::Jump(label) => self.push(Instr::Jmp(*label)),
             IrInstr::CJump {
@@ -747,13 +804,8 @@ impl Emitter<'_> {
                 *false_label,
                 value_width(*width),
             ),
-            IrInstr::Abort => self.push(Instr::Call("abort".to_string())),
+            IrInstr::Abort => self.push(Instr::CallDirect("abort".to_string())),
             IrInstr::Label(label) => self.push(Instr::Label(*label)),
-            IrInstr::Push(_) | IrInstr::Pop(_) => {
-                panic!(
-                    "push/pop are only inserted by prologue/epilogue. they should not appear here"
-                )
-            }
         }
     }
 }
@@ -943,7 +995,7 @@ impl Instr {
     fn base(&self) -> &'static str {
         match self {
             Self::Mov { .. } => "mov",
-            Self::Lea { .. } => "leaq",
+            Self::Lea { .. } | Self::FunctionAddress { .. } => "leaq",
             Self::Add { .. } => "add",
             Self::Sub { .. } => "sub",
             Self::And { .. } => "and",
@@ -970,7 +1022,7 @@ impl Instr {
             Self::Jge(_) => "jge",
 
             Self::Label(_) => "",
-            Self::Call(_) => "call",
+            Self::CallDirect(_) | Self::CallIndirect(_) => "call",
             Self::Ret => "ret",
 
             Self::Sete { .. } => "sete",
@@ -997,6 +1049,9 @@ impl fmt::Display for Instr {
                 src.asm(),
                 dest.name(Width::Qword)
             ),
+            Self::FunctionAddress { symbol, dest } => {
+                write!(f, "    leaq {symbol}(%rip), {}", dest.name(Width::Qword))
+            }
             Self::Mov { width, dest, src }
             | Self::Add { width, dest, src }
             | Self::Sub { width, dest, src }
@@ -1039,8 +1094,11 @@ impl fmt::Display for Instr {
             Self::Ret => {
                 write!(f, "    {}", self.base())
             }
-            Self::Call(name) => {
+            Self::CallDirect(name) => {
                 write!(f, "    {} {name}", self.base())
+            }
+            Self::CallIndirect(target) => {
+                write!(f, "    {} *{}", self.base(), target.asm(Width::Qword))
             }
             Self::Cmp { lhs, rhs, width } => {
                 write!(

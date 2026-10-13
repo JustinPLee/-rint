@@ -8,10 +8,9 @@ use crate::ast_parse::{
     AsnOp as CAsnOp, BinOp as CBinOp, Control, Decl as CDecl, Expr as CExpr,
     GlobalDecl as CGlobalDecl, LAsnOp as CLAsnOp, LBinOp as CLBinOp, LBlock as CLBlock, LControl,
     LDecl as CLDecl, LExpr as CLExpr, LGlobalDecl as CLGlobalDecl, LIdent as CLIdent,
-    LLValue as CLLValue, LParam as CLParam, LPostOp, LProgram as CProgram, LRetTyp, LSimp,
-    LStmt as CLStmt, LStructField as CLStructField, LTyp as CLTyp, LUnOp as CLUnOp,
-    LValue as CLValue, PostOp as CPostOp, RetTyp as CRetTyp, Simp as CSimp, Stmt as CStmt,
-    Typ as CTyp, UnOp as CUnOp,
+    LLValue as CLLValue, LParam as CLParam, LPostOp, LProgram as CProgram, LSimp, LStmt as CLStmt,
+    LStructField as CLStructField, LTyp as CLTyp, LUnOp as CLUnOp, LValue as CLValue,
+    PostOp as CPostOp, Simp as CSimp, Stmt as CStmt, Typ as CTyp, UnOp as CUnOp,
 };
 use crate::location::{Located, Location, loc};
 
@@ -36,8 +35,8 @@ fn elaborate_expr(expr: CLExpr) -> LExpr {
             true_expr: Box::new(elaborate_expr(*true_expr)),
             false_expr: Box::new(elaborate_expr(*false_expr)),
         },
-        CExpr::FunCall { name, args } => Expr::FunCall {
-            name: loc(name.data, name.location),
+        CExpr::Call { callee, args } => Expr::Call {
+            callee: Box::new(elaborate_expr(*callee)),
             args: args.into_iter().map(elaborate_expr).map(Box::new).collect(),
         },
         CExpr::Field { ident, field } => Expr::Field {
@@ -65,6 +64,7 @@ fn elaborate_expr(expr: CLExpr) -> LExpr {
             typ: elaborate_typ(typ),
             size: Box::new(elaborate_expr(*size)),
         },
+        CExpr::Dealloc(value) => Expr::Dealloc(Box::new(elaborate_expr(*value))),
         CExpr::ArrayLength(array) => Expr::ArrayLength(Box::new(elaborate_expr(*array))),
     };
 
@@ -239,20 +239,18 @@ fn elaborate_typ(typ: CLTyp) -> LTyp {
     let data = match typ.data {
         CTyp::Int => Typ::Int,
         CTyp::Bool => Typ::Bool,
+        CTyp::Void => Typ::Void,
         CTyp::Alias(t) => Typ::Alias(t),
         CTyp::Struct(t) => Typ::Struct(t),
         CTyp::Pointer(typ) => Typ::Pointer(Box::new(elaborate_typ(*typ))),
         CTyp::Array(typ) => Typ::Array(Box::new(elaborate_typ(*typ))),
+        CTyp::Function { params, ret_typ } => Typ::Function {
+            params: params.into_iter().map(elaborate_typ).collect(),
+            ret_typ: Box::new(elaborate_typ(*ret_typ)),
+        },
     };
 
     loc(data, typ.location)
-}
-
-fn elaborate_ret_typ(ret_typ: LRetTyp) -> LTyp {
-    match ret_typ.data {
-        CRetTyp::Typ(typ) => elaborate_typ(typ),
-        CRetTyp::Void => loc(Typ::Void, ret_typ.location),
-    }
 }
 
 fn elaborate_simp(simp: LSimp) -> LStmt {
@@ -485,7 +483,7 @@ fn elaborate_typedef(typ: CLTyp, alias: CLIdent) -> GlobalDecl {
 }
 
 fn elaborate_fundef(
-    ret_typ: LRetTyp,
+    ret_typ: CLTyp,
     name: CLIdent,
     params: Vec<CLParam>,
     body: Option<CLBlock>,
@@ -504,7 +502,7 @@ fn elaborate_fundef(
         .collect();
 
     GlobalDecl::FunDef {
-        ret_typ: elaborate_ret_typ(ret_typ),
+        ret_typ: elaborate_typ(ret_typ),
         name: loc(name.data, name.location),
         params: eparams,
         body: body.map(elaborate_block),

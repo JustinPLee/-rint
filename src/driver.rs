@@ -12,7 +12,7 @@ use crate::parser::{ParseError, Parser};
 use crate::token::Token;
 use crate::utils::{LabelGen, TempGen};
 use crate::x86::emit_assembly;
-use crate::{ir_function, ir_linear};
+use crate::ir_function;
 
 // pub struct Options {  do optimizations? dump specific phases? }
 
@@ -68,14 +68,10 @@ pub fn compile_source(filename: &str, source: &str) -> Result<String, CompileErr
         CompileError::Analysis(err)
     })?;
 
-    // IR linear code
+    // Function IR
     let mut temps = TempGen::new();
     let mut labels = LabelGen::new();
-    let module = ir_linear::translate(&ast.data, &types, &mut temps, &mut labels);
-    writeln!(dumpfile, "\n# (IR) linear:\n{}", module).expect("file write");
-
-    // IR function code
-    let function_ir = ir_function::translate(&module);
+    let function_ir = ir_function::translate(&ast.data, &types, &mut temps, &mut labels);
     writeln!(
         dumpfile,
         "\n# (IR) function with calling convention:\n{}",

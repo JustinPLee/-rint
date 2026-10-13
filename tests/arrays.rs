@@ -8,7 +8,7 @@ fn array_length_and_pass_by_reference() {
     let source = r#"
     int update(int[] values) {
         values[1] += 7;
-        return length_array(values);
+        return array_length(values);
     }
     int main() {
         int[] values = alloc_array(int, 3);
@@ -28,7 +28,7 @@ fn zero_length_and_nested_arrays() {
         int[][] rows = alloc_array(int[], 2);
         rows[0] = alloc_array(int, 1);
         rows[0][0] = 42;
-        return rows[0][0] + length_array(empty);
+        return rows[0][0] + array_length(empty);
     }
     "#;
     assert_eq!(run(source), 42);
@@ -37,8 +37,8 @@ fn zero_length_and_nested_arrays() {
 #[test]
 fn array_type_errors() {
     assert_analysis_error(
-        "int main() { return length_array(2); }",
-        AnalysisErrorKind::LengthNonArray,
+        "int main() { return array_length(2); }",
+        AnalysisErrorKind::ArrayLengthNonArray,
     );
     assert_analysis_error(
         "int main() { return 2[0]; }",
@@ -68,7 +68,7 @@ fn bounds_and_allocation_checks_abort() {
         run("int main() { int[] a = alloc_array(int, -1); return 0; }"),
         -1
     );
-    assert_eq!(run("int main() { int[] a = null; return length_array(a); }"), -1);
+    assert_eq!(run("int main() { int[] a = null; return array_length(a); }"), -1);
 }
 
 #[test]
@@ -87,4 +87,68 @@ fn compound_index_is_evaluated_once() {
     }
     "#;
     assert_eq!(run(source), 42);
+}
+
+#[test]
+fn bool_and_pointer_arrays_are_zeroed_and_keep_their_element_stride() {
+    let source = r#"
+    int main() {
+        bool[] flags = alloc_array(bool, 3);
+        int*[] pointers = alloc_array(int*, 2);
+        if (flags[0] || flags[1] || flags[2]
+            || pointers[0] != null || pointers[1] != null) {
+            return 1;
+        }
+
+        flags[2] = true;
+        int* value = alloc(int);
+        *value = 42;
+        pointers[1] = value;
+        if (!flags[2] || array_length(flags) != 3 || array_length(pointers) != 2) {
+            return 2;
+        }
+        return *pointers[1];
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
+fn arrays_can_be_returned_and_mutated_through_function_calls() {
+    let source = r#"
+    int[] make_values(int first) {
+        int[] values = alloc_array(int, 2);
+        values[0] = first;
+        return values;
+    }
+
+    int[] update_values(int[] values) {
+        values[1] += 5;
+        return values;
+    }
+
+    int main() {
+        int[] values = update_values(make_values(37));
+        return values[0] + values[1];
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
+fn array_function_arguments_must_match_element_types() {
+    let source = r#"
+    int first_value(int[] values) {
+        return values[0];
+    }
+
+    int main() {
+        bool[] values = alloc_array(bool, 1);
+        return first_value(values);
+    }
+    "#;
+
+    assert_analysis_error(source, AnalysisErrorKind::FunctionArgsTypeMismatch);
 }

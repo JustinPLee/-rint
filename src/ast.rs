@@ -15,6 +15,10 @@ pub enum Typ {
     Struct(LIdent),
     Pointer(Box<LTyp>),
     Array(Box<LTyp>),
+    Function {
+        params: Vec<LTyp>,
+        ret_typ: Box<LTyp>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +86,7 @@ pub enum Expr {
         typ: LTyp,
         size: Box<LExpr>,
     },
+    Dealloc(Box<LExpr>),
     ArrayLength(Box<LExpr>),
     LValue(LLValue),
     BinOp {
@@ -94,8 +99,8 @@ pub enum Expr {
         true_expr: Box<LExpr>,
         false_expr: Box<LExpr>,
     },
-    FunCall {
-        name: LIdent,
+    Call {
+        callee: Box<LExpr>,
         args: Vec<Box<LExpr>>,
     },
 }
@@ -200,6 +205,11 @@ impl Pretty for Typ {
             Typ::Struct(typ) => format!("struct {typ}"),
             Typ::Pointer(typ) => format!("{}*", typ.pretty(0)),
             Typ::Array(typ) => format!("{}[]", typ.pretty(0)),
+            Typ::Function { params, ret_typ } => format!(
+                "fn({}) -> {}",
+                params.iter().map(|param| param.data.pretty(0)).join(", "),
+                ret_typ.data.pretty(0)
+            ),
         }
     }
 }
@@ -382,13 +392,12 @@ impl Pretty for Expr {
                 s
             }
 
-            Expr::FunCall { name, args } => {
-                let mut s = String::new();
-                write!(s, "(call {}", name).unwrap();
+            Expr::Call { callee, args } => {
+                let mut s = format!("(call {}", callee.data.pretty(indent));
                 for arg in args {
                     write!(s, " {}", arg.data.pretty(indent)).unwrap();
                 }
-                s.push_str(")");
+                s.push(')');
                 s
             }
             Expr::Field { ident, field } => {
@@ -408,7 +417,8 @@ impl Pretty for Expr {
                 typ.pretty(indent),
                 size.data.pretty(indent)
             ),
-            Expr::ArrayLength(array) => format!("(length_array {})", array.data.pretty(indent)),
+            Expr::Dealloc(value) => format!("(dealloc {})", value.data.pretty(indent)),
+            Expr::ArrayLength(array) => format!("(array_length {})", array.data.pretty(indent)),
             Expr::LValue(value) => format!("(LValue {})", value),
         }
     }

@@ -1,8 +1,8 @@
 // liveness on function IR
 
-use crate::ir_function::{FunctionSlot, Instr, LOperand, Operand, PseudoOp, abstract_name};
+use crate::ir_function::{CallTarget, FunctionSlot, Instr, LOperand, Operand, PseudoOp};
 use crate::utils::{Label, Temp};
-use crate::x86::Register;
+use crate::x86::{Register, abstract_name};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -24,7 +24,6 @@ impl Node {
     fn from_operand(operand: &Operand) -> Option<Self> {
         match operand {
             Operand::Temp(temp) => Some(Self::Temp(*temp)),
-            Operand::Register(register) => Some(Self::from_register(*register)),
             Operand::FunctionSlot(slot) => Some(Self::FunctionSlot(*slot)),
             Operand::Imm(_) | Operand::StackArgIndex(_) => None,
         }
@@ -109,11 +108,18 @@ fn uses(instr: &Instr) -> HashSet<Node> {
             }
             result
         }
-        Instr::Call { arg_count, .. } => (0..*arg_count)
-            .map(|index| Node::FunctionSlot(FunctionSlot::Arg(index)))
-            .collect(),
-        Instr::Push(register) => HashSet::from([Node::from_register(*register)]),
-        Instr::Pop(_) => HashSet::new(),
+        Instr::Call { callee, arg_count } => {
+            let mut result: HashSet<Node> = (0..*arg_count)
+                .map(|index| Node::FunctionSlot(FunctionSlot::Arg(index)))
+                .collect();
+            if let CallTarget::Indirect(target) = callee
+                && let Some(node) = to_node(target)
+            {
+                result.insert(node);
+            }
+            result
+        }
+        Instr::FunctionAddress { .. } => HashSet::new(),
         Instr::Jump(_) => HashSet::new(),
         Instr::Abort => HashSet::new(),
         Instr::CJump { lhs, rhs, .. } => {
@@ -136,9 +142,9 @@ fn uses(instr: &Instr) -> HashSet<Node> {
 fn defs(instr: &Instr) -> HashSet<Node> {
     match instr {
         Instr::Move { dest, .. } => to_node(dest).into_iter().collect(),
-        Instr::Load { dest, .. } | Instr::Address { dest, .. } => {
-            to_node(dest).into_iter().collect()
-        }
+        Instr::Load { dest, .. }
+        | Instr::Address { dest, .. }
+        | Instr::FunctionAddress { dest, .. } => to_node(dest).into_iter().collect(),
         Instr::BinOp { dest, op, .. } => {
             let mut result: HashSet<Node> = to_node(dest).into_iter().collect();
             if matches!(op.data, PseudoOp::Div | PseudoOp::Mod) {
@@ -153,14 +159,12 @@ fn defs(instr: &Instr) -> HashSet<Node> {
             result.extend(Register::CALLER_SAVED.into_iter().map(Node::from_register));
             result
         }
-        Instr::Pop(register) => HashSet::from([Node::from_register(*register)]),
         Instr::Jump(_)
         | Instr::Abort
         | Instr::Store { .. }
         | Instr::CJump { .. }
         | Instr::Return
-        | Instr::Label(_)
-        | Instr::Push(_) => HashSet::new(),
+        | Instr::Label(_) => HashSet::new(),
     }
 }
 
@@ -285,6 +289,14 @@ impl InterferenceGraph {
             }
             for &def in &instr.defs {
                 for &live in &instr.live_out {
+                    // The copy source can share the destination's color.
+                    if matches!(
+                        &instr.instr,
+                        Instr::Move { dest, src, .. }
+                            if to_node(dest) == Some(def) && to_node(src) == Some(live)
+                    ) {
+                        continue;
+                    }
                     graph.add_edge(def, live);
                 }
             }
@@ -360,8 +372,7 @@ impl fmt::Display for InterferenceGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir_linear::ValueWidth;
-    use crate::ir_linear::{LPseudoOp, PseudoOp};
+    use crate::ir_function::{LPseudoOp, PseudoOp, ValueWidth};
     use crate::location::{Location, loc};
 
     // for testing purposes
@@ -386,7 +397,7 @@ mod tests {
             },
             Instr::CJump {
                 lhs: operand(t0.clone()),
-                op: pseudo_op(crate::ir_linear::PseudoOp::EqualEq),
+                op: pseudo_op(PseudoOp::EqualEq),
                 rhs: operand(Operand::Imm(1)),
                 true_target: Label(0),
                 false_target: Label(2),
@@ -410,7 +421,7 @@ mod tests {
             Instr::BinOp {
                 dest: operand(t2.clone()),
                 lhs: operand(t0),
-                op: pseudo_op(crate::ir_linear::PseudoOp::Add),
+                op: pseudo_op(PseudoOp::Add),
                 rhs: operand(t1),
                 width: ValueWidth::Dword,
             },

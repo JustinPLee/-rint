@@ -1,8 +1,11 @@
 mod helpers;
 
 use helpers::{compile_err, run};
-use rint::analysis::AnalysisErrorKind;
+use rint::analysis::{AnalysisError, AnalysisErrorKind, Env, RType, semantic_analysis};
 use rint::driver::CompileError;
+use rint::elaboration::elaborate;
+use rint::lexer::Lexer;
+use rint::parser::Parser;
 
 use crate::helpers::assert_analysis_error;
 #[test]
@@ -200,7 +203,7 @@ fn void_value_is_rejected() {
 }
 
 #[test]
-fn function_used_as_variable_is_rejected() {
+fn function_value_cannot_return_as_int() {
     let source = r#"
     int helper() {
         return 1;
@@ -211,7 +214,67 @@ fn function_used_as_variable_is_rejected() {
     }
     "#;
 
-    assert_analysis_error(source, AnalysisErrorKind::FunctionIsValue);
+    assert_analysis_error(source, AnalysisErrorKind::FunctionInvalidReturnType);
+}
+
+fn analyze_only(source: &str) -> Result<Env, AnalysisError> {
+    let tokens = Lexer::new(source.as_bytes()).lex();
+    let mut parser = Parser::new(&tokens);
+    let parsed = parser.parse();
+    assert!(parser.errors().is_none(), "{:?}", parser.errors());
+    semantic_analysis(&elaborate(parsed))
+}
+
+#[test]
+fn first_class_function_types_and_calls() {
+    let source = r#"
+    int inc(int x) {
+        return x + 1;
+    }
+
+    fn(int) -> int identity(fn(int) -> int f) {
+        return f;
+    }
+
+    int main() {
+        fn(int) -> int f = identity(inc);
+        return identity(f)(1);
+    }
+    "#;
+
+    let env = analyze_only(source).expect("function values should type-check");
+    let function_type = RType::Function {
+        params: vec![RType::Int],
+        ret_typ: Box::new(RType::Int),
+    };
+    assert_eq!(
+        env.function_type("identity"),
+        (vec![function_type.clone()], function_type)
+    );
+}
+
+#[test]
+fn function_value_call_checks_arguments() {
+    let source = r#"
+    int main() {
+        fn(int) -> int f = null;
+        return f(true);
+    }
+    "#;
+
+    assert_eq!(
+        analyze_only(source).unwrap_err().kind,
+        AnalysisErrorKind::FunctionArgsTypeMismatch
+    );
+}
+
+#[test]
+fn computed_non_function_cannot_be_called() {
+    let source = "int main() { return (1 + 2)(); }";
+    assert_eq!(
+        analyze_only(source).unwrap_err().kind,
+        AnalysisErrorKind::CallNonFunction
+    );
 }
 
 #[test]

@@ -123,53 +123,6 @@ int main() {
     ))
 )
 
-# (IR) linear:
-fn pow(t0, t1):
-    if t1 == 0 jump L0 else jump L1
-L0:
-    return 1
-L1:
-    t2 ← t1 sub 1
-    t3 ← call pow(t0, t2)
-    t4 ← t0 mul t3
-    return t4
-
-fn main():
-    t5 ← 0
-    t6 ← 1
-    jump L3
-L3:
-    if t6 <= 3 jump L2 else jump L5
-L2:
-    t7 ← call pow(t6, 2)
-    t8 ← t5 add t7
-    t5 ← t8
-    jump L4
-L4:
-    t9 ← t6 add 1
-    t6 ← t9
-    jump L3
-L5:
-    t10 ← 1 mul 1
-    t11 ← 2 mul 2
-    t12 ← t10 add t11
-    t13 ← 3 mul 3
-    t14 ← t12 add t13
-    if t14 == 14 jump L6 else jump L7
-L6:
-    jump L8
-L7:
-    abort
-L8:
-    if t5 == 14 jump L9 else jump L10
-L9:
-    jump L11
-L10:
-    abort
-L11:
-    return t5
-
-
 # (IR) function with calling convention:
 fn pow(t0, t1):
     t0 ← arg1

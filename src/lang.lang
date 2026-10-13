@@ -1,14 +1,23 @@
-struct B {
-  int x;
-};
+void map(int[] arr, fn(int) -> int f) {
+  for (int i = 0; i < array_length(arr); i++) {
+    arr[i] = f(arr[i]);
+  }
+  return;
+}
 
-typedef struct B B;
+int double(int x) {
+  return x + x;
+}
 
 int main() {
-  int[] a = alloc_array(int, 2);
-  a[2] = 2;
-  B*[] bs = alloc_array(B*, 10);
-  bs[0] = alloc(B);
-  bs[0]->x = 2;
-  return bs[0]->x;
+  int[] arr = alloc_array(int, 4);
+  for(int i = 0; i < array_length(arr); i++) {
+    arr[i] = i + 1;
+  }
+
+  map(arr, double);
+
+  int ret = arr[0];
+  dealloc(arr);
+  return ret;
 }

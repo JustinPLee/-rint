@@ -261,7 +261,7 @@ fn struct_values_cannot_be_declared_by_value() {
     }
     "#;
 
-    assert_analysis_error(source, AnalysisErrorKind::StructValueNotAllowed);
+    assert_analysis_error(source, AnalysisErrorKind::ValueNotAllowed);
 }
 
 #[test]
@@ -277,4 +277,71 @@ fn array_fields_store_array_references() {
     "#;
 
     assert_eq!(run(source), 42);
+}
+
+#[test]
+fn arrays_of_struct_pointers_preserve_elements_across_function_calls() {
+    let source = r#"
+    struct Item {
+        bool active;
+        int value;
+    };
+
+    int merge_values(struct Item* left, struct Item* right) {
+        if (!left->active || !right->active) {
+            return 1;
+        }
+        left->value += right->value;
+        return left->value;
+    }
+
+    int main() {
+        struct Item*[] items = alloc_array(struct Item*, 2);
+        if (items[0] != null || items[1] != null) {
+            return 2;
+        }
+
+        items[0] = alloc(struct Item);
+        items[1] = alloc(struct Item);
+        items[0]->active = true;
+        items[1]->active = true;
+        items[0]->value = 19;
+        items[1]->value = 23;
+        return merge_values(items[0], items[1]);
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
+fn struct_values_are_rejected_in_function_signatures_and_arrays() {
+    assert_analysis_error(
+        r#"
+        struct Item { int value; };
+        int read_item(struct Item item) { return item.value; }
+        int main() { return 0; }
+        "#,
+        AnalysisErrorKind::ValueNotAllowed,
+    );
+
+    assert_analysis_error(
+        r#"
+        struct Item { int value; };
+        struct Item make_item() { return null; }
+        int main() { return 0; }
+        "#,
+        AnalysisErrorKind::ValueNotAllowed,
+    );
+
+    assert_analysis_error(
+        r#"
+        struct Item { int value; };
+        int main() {
+            struct Item[] items = alloc_array(struct Item, 1);
+            return 0;
+        }
+        "#,
+        AnalysisErrorKind::ValueNotAllowed,
+    );
 }

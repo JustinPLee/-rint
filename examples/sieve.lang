@@ -1,8 +1,8 @@
-// Arrays are passed by reference, and length_array reads their length.
+// Arrays are passed by reference, and array_length reads their length.
 void mark_composites(bool[] composite) {
-    for (int p = 2; p * p < length_array(composite); p++) {
+    for (int p = 2; p * p < array_length(composite); p++) {
         if (!composite[p]) {
-            for (int multiple = p * p; multiple < length_array(composite); multiple += p) {
+            for (int multiple = p * p; multiple < array_length(composite); multiple += p) {
                 composite[multiple] = true;
             }
         }
@@ -12,7 +12,7 @@ void mark_composites(bool[] composite) {
 
 int count_primes(bool[] composite) {
     int count = 0;
-    for (int n = 2; n < length_array(composite); n++) {
+    for (int n = 2; n < array_length(composite); n++) {
         if (!composite[n]) {
             count++;
         }

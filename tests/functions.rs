@@ -56,6 +56,30 @@ fn nested_function_calls() {
 }
 
 #[test]
+fn first_class_function_values_can_be_passed_returned_and_called() {
+    let source = r#"
+    int add(int left, int right) {
+        return left + right;
+    }
+
+    int twenty_one() {
+        return 21;
+    }
+
+    fn(int, int) -> int identity(fn(int, int) -> int function) {
+        return function;
+    }
+
+    int main() {
+        fn(int, int) -> int function = identity(add);
+        return identity(function)(twenty_one(), twenty_one());
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
 fn caller_values_survive_a_call() {
     let source = r#"
     int add(int x, int y) {
@@ -186,4 +210,77 @@ fn wrong_function_argument_count_is_rejected() {
     "#;
 
     assert_analysis_error(source, AnalysisErrorKind::FunctionArgsCountMismatch);
+}
+
+#[test]
+fn declaration_can_be_called_before_its_definition() {
+    let source = r#"
+    int helper(int value);
+
+    int main() {
+        return helper(42);
+    }
+
+    int helper(int value) {
+        return value;
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
+fn function_pointer_passed_on_stack_can_be_called_indirectly() {
+    let source = r#"
+    int add_twenty_one(int value) {
+        return value + 21;
+    }
+
+    int invoke_seven(int a, int b, int c, int d, int e, int f,
+                     fn(int) -> int callback) {
+        return callback(a + b + c + d + e + f);
+    }
+
+    int main() {
+        return invoke_seven(1, 2, 3, 4, 5, 6, add_twenty_one);
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
+fn function_arguments_with_side_effects_are_evaluated_once() {
+    let source = r#"
+    int next(int[] state) {
+        state[0]++;
+        return state[0];
+    }
+
+    int sum(int left, int right) {
+        return left + right;
+    }
+
+    int main() {
+        int[] state = alloc_array(int, 1);
+        return sum(next(state), next(state)) * 10 + state[0] * 6;
+    }
+    "#;
+
+    assert_eq!(run(source), 42);
+}
+
+#[test]
+fn wrong_function_argument_type_is_rejected() {
+    let source = r#"
+    int identity(int value) {
+        return value;
+    }
+
+    int main() {
+        return identity(true);
+    }
+    "#;
+
+    assert_analysis_error(source, AnalysisErrorKind::FunctionArgsTypeMismatch);
 }

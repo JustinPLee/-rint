@@ -21,6 +21,7 @@ pub enum AnalysisErrorKind {
     VoidUsedAsValue,
     VoidUsedAsVariableType,
     VariableCalledAsFunction,
+    CallNonFunction,
     VariableShadowsFunction,
 
     FunctionNotFound,
@@ -33,7 +34,6 @@ pub enum AnalysisErrorKind {
     FunctionParamTypeMismatch,
     FunctionArgsCountMismatch,
     FunctionArgsTypeMismatch,
-    FunctionIsValue,
 
     VariableRedeclaration,
     VariableIsType,
@@ -50,11 +50,12 @@ pub enum AnalysisErrorKind {
     StructEmpty,
     FieldAccessOnNonStruct,
     UndefinedStruct,
-    StructValueNotAllowed,
+    ValueNotAllowed,
 
     DereferenceNonPointer,
+    DeallocNonPointer,
     IndexNonArray,
-    LengthNonArray,
+    ArrayLengthNonArray,
 
     MainMissing,
     MainNotDefined,
@@ -86,6 +87,10 @@ pub enum RType {
     Struct(String),
     Pointer(Box<RType>),
     Array(Box<RType>),
+    Function {
+        params: Vec<RType>,
+        ret_typ: Box<RType>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -426,12 +431,7 @@ pub fn tc_expr(expr: &LExpr, env: &Env) -> Result<RType, AnalysisError> {
         Expr::AllocArray { typ, size } => {
             let element = env.resolve_non_void_type(&typ.data, typ.location.clone())?;
             env.check_type_is_defined(&element, typ.location.clone())?;
-            if matches!(element, RType::Struct(_)) {
-                return Err(AnalysisError::new(
-                    AnalysisErrorKind::StructValueNotAllowed,
-                    typ.location.clone(),
-                ));
-            }
+            check_is_valid_value(&element, typ.location.clone())?;
             require_type(
                 &tc_value_expr(size, env)?,
                 &RType::Int,
@@ -439,10 +439,17 @@ pub fn tc_expr(expr: &LExpr, env: &Env) -> Result<RType, AnalysisError> {
             )?;
             Ok(RType::Array(Box::new(element)))
         }
+        Expr::Dealloc(value) => match tc_value_expr(value, env)? {
+            RType::Pointer(_) | RType::Array(_) | RType::Null => Ok(RType::Void),
+            _ => Err(AnalysisError::new(
+                AnalysisErrorKind::DeallocNonPointer,
+                value.location.clone(),
+            )),
+        },
         Expr::ArrayLength(array) => match tc_value_expr(array, env)? {
             RType::Array(_) => Ok(RType::Int),
             _ => Err(AnalysisError::new(
-                AnalysisErrorKind::LengthNonArray,
+                AnalysisErrorKind::ArrayLengthNonArray,
                 array.location.clone(),
             )),
         },
@@ -452,7 +459,7 @@ pub fn tc_expr(expr: &LExpr, env: &Env) -> Result<RType, AnalysisError> {
             true_expr,
             false_expr,
         } => tc_ternop(cond, true_expr, false_expr, env),
-        Expr::FunCall { name, args } => tc_call(name, args, env),
+        Expr::Call { callee, args } => tc_call(callee, args, env),
     }
 }
 
@@ -465,10 +472,11 @@ fn tc_ident(name: &str, location: &Location, env: &Env) -> Result<RType, Analysi
     }
 
     if env.functions.contains_key(name) {
-        return Err(AnalysisError::new(
-            AnalysisErrorKind::FunctionIsValue,
-            location.clone(),
-        ));
+        let (params, ret_typ) = env.function_type(name);
+        return Ok(RType::Function {
+            params,
+            ret_typ: Box::new(ret_typ),
+        });
     }
 
     let typ = env
@@ -564,31 +572,36 @@ fn tc_return(
     Ok(())
 }
 
-fn tc_call(name: &LIdent, args: &[Box<LExpr>], env: &Env) -> Result<RType, AnalysisError> {
-    if env.variables.contains_key(&name.data) {
-        return Err(AnalysisError::new(
-            AnalysisErrorKind::VariableCalledAsFunction,
-            name.location.clone(),
-        ));
-    }
-
-    let function = env.functions.get(&name.data).ok_or_else(|| {
-        AnalysisError::new(AnalysisErrorKind::FunctionNotFound, name.location.clone())
+fn tc_call(callee: &LExpr, args: &[Box<LExpr>], env: &Env) -> Result<RType, AnalysisError> {
+    let callee_type = tc_value_expr(callee, env).map_err(|error| {
+        if matches!(callee.data, Expr::Ident(_))
+            && error.kind == AnalysisErrorKind::VariableNotFound
+        {
+            AnalysisError::new(AnalysisErrorKind::FunctionNotFound, callee.location.clone())
+        } else {
+            error
+        }
     })?;
+    let RType::Function { params, ret_typ } = callee_type else {
+        let kind = if matches!(callee.data, Expr::Ident(_)) {
+            AnalysisErrorKind::VariableCalledAsFunction
+        } else {
+            AnalysisErrorKind::CallNonFunction
+        };
+        return Err(AnalysisError::new(kind, callee.location.clone()));
+    };
 
-    if function.params.len() != args.len() {
+    if params.len() != args.len() {
         return Err(AnalysisError::new(
             AnalysisErrorKind::FunctionArgsCountMismatch,
-            name.location.clone(),
+            callee.location.clone(),
         ));
     }
 
     // check each arg and param type in step
-    for (arg, param) in zip(args, &function.params) {
+    for (arg, param_type) in zip(args, &params) {
         let arg_type = tc_value_expr(arg, env)?;
-        let param_type =
-            env.resolve_non_void_type(&param.data.typ.data, param.data.typ.location.clone())?;
-        if !types_are_comparable_eq(&arg_type, &param_type) {
+        if !types_are_comparable_eq(&arg_type, param_type) {
             return Err(AnalysisError::new(
                 AnalysisErrorKind::FunctionArgsTypeMismatch,
                 arg.location.clone(),
@@ -596,7 +609,7 @@ fn tc_call(name: &LIdent, args: &[Box<LExpr>], env: &Env) -> Result<RType, Analy
         }
     }
 
-    env.resolve_type(&function.ret_typ.data, function.ret_typ.location.clone())
+    Ok(*ret_typ)
 }
 
 fn tc_value_expr(expr: &LExpr, env: &Env) -> Result<RType, AnalysisError> {
@@ -709,6 +722,17 @@ fn require_type(a: &RType, b: &RType, location: Location) -> Result<(), Analysis
     Ok(())
 }
 
+fn check_is_valid_value(typ: &RType, location: Location) -> Result<(), AnalysisError> {
+    if matches!(typ, RType::Struct(_)) {
+        return Err(AnalysisError::new(
+            AnalysisErrorKind::ValueNotAllowed,
+            location,
+        ));
+    }
+
+    Ok(())
+}
+
 fn types_are_comparable_eq(a: &RType, b: &RType) -> bool {
     match (a, b) {
         // null pointers can be any type of pointer
@@ -716,7 +740,9 @@ fn types_are_comparable_eq(a: &RType, b: &RType) -> bool {
         | (RType::Null, RType::Pointer(_))
         | (RType::Pointer(_), RType::Null)
         | (RType::Null, RType::Array(_))
-        | (RType::Array(_), RType::Null) => true,
+        | (RType::Array(_), RType::Null)
+        | (RType::Null, RType::Function { .. })
+        | (RType::Function { .. }, RType::Null) => true,
         _ => a == b,
     }
 }
@@ -730,6 +756,8 @@ fn least_common_parent_type(a: &RType, b: &RType) -> Option<RType> {
             (RType::Pointer(_), RType::Null) => Some(a.clone()),
             (RType::Null, RType::Array(_)) => Some(b.clone()),
             (RType::Array(_), RType::Null) => Some(a.clone()),
+            (RType::Null, RType::Function { .. }) => Some(b.clone()),
+            (RType::Function { .. }, RType::Null) => Some(a.clone()),
             _ => None,
         }
     }
@@ -748,8 +776,8 @@ impl AnalysisError {
                 "function returned a value of the wrong type"
             }
             AnalysisErrorKind::VoidUsedAsValue => "void value used where a value is required",
-            AnalysisErrorKind::FunctionIsValue => "function used as a value",
             AnalysisErrorKind::VariableCalledAsFunction => "variable used as a function",
+            AnalysisErrorKind::CallNonFunction => "cannot call a non-function value",
             AnalysisErrorKind::VariableShadowsFunction => "variable name shadows a function",
             AnalysisErrorKind::FunctionRedeclaration => "function is redeclared",
             AnalysisErrorKind::FunctionRedefinition => "function is redefined",
@@ -791,9 +819,10 @@ impl AnalysisError {
             AnalysisErrorKind::FieldAccessOnNonStruct => "field access requires a struct value",
             AnalysisErrorKind::UndefinedStruct => "struct is undefined",
             AnalysisErrorKind::DereferenceNonPointer => "cannot dereference a non-pointer value",
-            AnalysisErrorKind::StructValueNotAllowed => "struct values cannot be copied by value",
+            AnalysisErrorKind::DeallocNonPointer => "dealloc requires a pointer, array, or null",
+            AnalysisErrorKind::ValueNotAllowed => "value not allowed",
             AnalysisErrorKind::IndexNonArray => "indexing requires an array",
-            AnalysisErrorKind::LengthNonArray => "length_array requires an array",
+            AnalysisErrorKind::ArrayLengthNonArray => "array_length requires an array",
         };
 
         Self {
@@ -849,7 +878,7 @@ impl Env {
     pub fn layout(&self, typ: &RType) -> (i32, i32) {
         match typ {
             RType::Bool | RType::Int => (4, 4),
-            RType::Pointer(_) | RType::Array(_) | RType::Null => (8, 8),
+            RType::Pointer(_) | RType::Array(_) | RType::Function { .. } | RType::Null => (8, 8),
             RType::Struct(name) => {
                 let sinfo = self.structs.get(name).unwrap();
                 (sinfo.size, sinfo.align)
@@ -1076,23 +1105,13 @@ impl Env {
         let ret_typ_location = function.ret_typ.location.clone();
         let ret_typ = self.resolve_type(&function.ret_typ.data, ret_typ_location.clone())?;
         self.check_type_is_defined(&ret_typ, ret_typ_location.clone())?;
-        if matches!(ret_typ, RType::Struct(_)) {
-            return Err(AnalysisError::new(
-                AnalysisErrorKind::StructValueNotAllowed,
-                ret_typ_location,
-            ));
-        }
+        check_is_valid_value(&ret_typ, ret_typ_location)?;
 
         for parameter in &function.params {
             let typ_location = parameter.data.typ.location.clone();
             let typ = self.resolve_non_void_type(&parameter.data.typ.data, typ_location.clone())?;
             self.check_type_is_defined(&typ, typ_location.clone())?;
-            if matches!(typ, RType::Struct(_)) {
-                return Err(AnalysisError::new(
-                    AnalysisErrorKind::StructValueNotAllowed,
-                    typ_location,
-                ));
-            }
+            check_is_valid_value(&typ, typ_location)?;
         }
 
         Ok(function)
@@ -1223,13 +1242,25 @@ impl Env {
             Typ::Array(element) => {
                 let element =
                     self.resolve_non_void_type(&element.data, element.location.clone())?;
-                if matches!(element, RType::Struct(_)) {
-                    return Err(AnalysisError::new(
-                        AnalysisErrorKind::StructValueNotAllowed,
-                        location,
-                    ));
-                }
+                check_is_valid_value(&element, location)?;
                 Ok(RType::Array(Box::new(element)))
+            }
+            Typ::Function { params, ret_typ } => {
+                let mut resolved_params = Vec::new();
+                for param in params {
+                    let param_type =
+                        self.resolve_non_void_type(&param.data, param.location.clone())?;
+                    self.check_type_is_defined(&param_type, param.location.clone())?;
+                    check_is_valid_value(&param_type, param.location.clone())?;
+                    resolved_params.push(param_type);
+                }
+                let return_type = self.resolve_type(&ret_typ.data, ret_typ.location.clone())?;
+                self.check_type_is_defined(&return_type, ret_typ.location.clone())?;
+                check_is_valid_value(&return_type, ret_typ.location.clone())?;
+                Ok(RType::Function {
+                    params: resolved_params,
+                    ret_typ: Box::new(return_type),
+                })
             }
         }
     }
@@ -1276,12 +1307,7 @@ impl Env {
         let typ_location = typ.location.clone();
         let resolved_type = self.resolve_non_void_type(&typ.data, typ_location.clone())?;
         self.check_type_is_defined(&resolved_type, typ_location)?;
-        if matches!(&resolved_type, RType::Struct(_)) {
-            return Err(AnalysisError::new(
-                AnalysisErrorKind::StructValueNotAllowed,
-                typ.location.clone(),
-            ));
-        }
+        check_is_valid_value(&resolved_type, typ.location.clone())?;
         self.variables.insert(name, resolved_type);
         Ok(())
     }

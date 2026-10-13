@@ -1,14 +1,45 @@
-// linear IR but with parameters and return values of functions made explicit
+// ast -> function ir
 
+use std::collections::HashMap;
 use std::fmt;
 
-use crate::ast::LIdent;
-use crate::ir_linear;
-use crate::ir_linear::ValueWidth;
-pub use crate::ir_linear::{LPseudoOp, PseudoOp};
-use crate::location::{Located, loc};
-use crate::utils::{Label, Temp};
-use crate::x86::{ARG_REGS, RETURN_REG, Register}; // messy abstraction layers but its ok for now
+use crate::analysis::{Env, RType, tc_expr};
+use crate::ast::{
+    AsnOp, BinOp, Expr as AstExpr, GlobalDecl, LBinOp, LBlock, LExpr, LIdent, LLValue, LStmt,
+    LValue, PostOp, Program as AstProgram, Stmt as AstStmt,
+};
+use crate::location::{Located, Location, loc};
+use crate::utils::{LABEL_ABORT_NULL_DEREF, Label, LabelGen, Temp, TempGen};
+
+const DO_MEMORY_CHECKS: bool = true;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PseudoOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
+    EqualEq,
+    NotEq,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueWidth {
+    Dword,
+    Qword,
+}
+
+pub type LPseudoOp = Located<PseudoOp>;
 
 #[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, Eq, PartialEq)]
 pub enum FunctionSlot {
@@ -16,53 +47,23 @@ pub enum FunctionSlot {
     ReturnValue,
 }
 
-impl FunctionSlot {
-    pub fn register(self) -> Option<Register> {
-        match self {
-            Self::Arg(index) => ARG_REGS.get(index).copied(),
-            Self::ReturnValue => Some(RETURN_REG),
-        }
-    }
-}
-
-pub fn abstract_name(register: Register) -> &'static str {
-    match register {
-        Register::Rax => "res0",
-        Register::Rdi => "arg1",
-        Register::Rsi => "arg2",
-        Register::Rdx => "arg3",
-        Register::Rcx => "arg4",
-        Register::R8 => "arg5",
-        Register::R9 => "arg6",
-        // caller
-        Register::R10 => "ler7",
-        Register::R11 => "ler8",
-        // callee
-        Register::Rbx => "lee9",
-        Register::Rbp => "lee10",
-        Register::R12 => "lee11",
-        Register::R13 => "lee12",
-        Register::R14 => "lee13",
-        Register::R15 => "lee14",
-        Register::Rsp => "rsp",
-    }
-}
-
 #[derive(Clone, Debug, Hash, PartialOrd, Ord, Eq, PartialEq)]
 pub enum Operand {
     Imm(i32),
     Temp(Temp),
-    Register(Register),
     StackArgIndex(usize),
     FunctionSlot(FunctionSlot),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallTarget {
+    Direct(LIdent),     // fn(y)
+    Indirect(LOperand), // arr_of_fns[x](y)
+}
+
 impl Operand {
     pub fn has_name(&self) -> bool {
-        matches!(
-            self,
-            Self::Temp(_) | Self::Register(_) | Self::FunctionSlot(_)
-        )
+        matches!(self, Self::Temp(_) | Self::FunctionSlot(_))
     }
 }
 
@@ -97,14 +98,15 @@ pub enum Instr {
         scale: u8,
         displacement: i32,
     },
+    FunctionAddress {
+        dest: LOperand,
+        function: LIdent,
+    },
     Return,
     Call {
-        callee: LIdent,
+        callee: CallTarget,
         arg_count: usize,
     },
-    Push(Register),
-    Pop(Register),
-    Abort,
     Jump(Label),
     CJump {
         lhs: LOperand,
@@ -115,6 +117,7 @@ pub enum Instr {
         width: ValueWidth,
     },
     Label(Label),
+    Abort,
 }
 
 pub type LOperand = Located<Operand>;
@@ -135,226 +138,1132 @@ pub struct Module {
     pub functions: Vec<Function>,
 }
 
-fn trans_oper(oper: &ir_linear::LOperand) -> LOperand {
-    loc(
-        match oper.data {
-            ir_linear::Operand::Imm(n) => Operand::Imm(n),
-            ir_linear::Operand::Temp(t) => Operand::Temp(t),
-        },
-        oper.location.clone(),
-    )
+// for *some* optimization of duplicated labels
+// ex:
+//  if (true) {
+//      return 2;
+//  } else {
+//      return 3;
+//  }
+//
+//  both branches terminate so the label after false branch that true branch usually
+//  jumps to is redundant and never jumped to
+//
+//  instructions of a particular block also stop being emitted if all paths of that block return
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    FallsThrough,
+    Terminates,
 }
 
-fn trans_function(function: &ir_linear::Function) -> Function {
-    let location = function
-        .body
-        .0
-        .first()
-        .map(|instr| instr.location.clone())
-        .unwrap_or_else(|| function.name.location.clone());
-    let mut body = Vec::new();
+// for nested while and for loops
+#[derive(Clone, Copy, Debug)]
+struct LoopLabels {
+    break_label: Label,
+    continue_label: Label,
+}
 
-    for (i, &param) in function.params.iter().enumerate() {
-        let (dest, src) = (
-            loc(Operand::Temp(param), location.clone()),
-            loc(
-                Operand::FunctionSlot(FunctionSlot::Arg(i)),
-                location.clone(),
-            ),
-        );
-        body.push(loc(
-            Instr::Move {
-                dest,
-                src,
-                width: function.param_widths[i],
-            },
-            location.clone(),
-        ));
+#[derive(Debug)]
+struct Ctx<'a> {
+    env: HashMap<String, Temp>, // variable -> temp
+    types: Env,
+    ret_width: ValueWidth,
+    tempgen: &'a mut TempGen,
+    labelgen: &'a mut LabelGen,
+    loop_stack: Vec<LoopLabels>,
+    stmts: Vec<LInstr>,
+}
+
+enum Place {
+    Local(Temp, RType),
+    Memory(LOperand, RType),
+}
+
+fn type_width(typ: &RType) -> ValueWidth {
+    match typ {
+        RType::Pointer(_)
+        | RType::Array(_)
+        | RType::Function { .. }
+        | RType::Null
+        | RType::Struct(_) => ValueWidth::Qword,
+        _ => ValueWidth::Dword,
+    }
+}
+
+impl Flow {
+    fn falls_through(self) -> bool {
+        self == Self::FallsThrough
+    }
+}
+
+impl<'a> Ctx<'a> {
+    fn push(&mut self, instr: Instr, location: Location) {
+        self.stmts.push(loc(instr, location));
     }
 
-    for instr in &function.body.0 {
-        let src_loc = instr.location.clone();
-        match &instr.data {
-            ir_linear::Instr::Move { dest, src, width } => body.push(loc(
-                Instr::Move {
-                    dest: trans_oper(dest),
-                    src: trans_oper(src),
-                    width: *width,
-                },
-                src_loc,
-            )),
-            ir_linear::Instr::BinOp {
-                dest,
-                lhs,
-                op,
-                rhs,
-                width,
-            } => body.push(loc(
-                Instr::BinOp {
-                    dest: trans_oper(dest),
-                    lhs: trans_oper(lhs),
-                    op: op.clone(),
-                    rhs: trans_oper(rhs),
-                    width: *width,
-                },
-                src_loc,
-            )),
-            ir_linear::Instr::Load {
-                dest,
-                address,
-                width,
-            } => body.push(loc(
+    // TODO: this recomputes types for expressions, find a way to avoid redoing this work
+    // works for now..
+    fn get_type(&self, expr: &LExpr) -> RType {
+        tc_expr(expr, &self.types).unwrap()
+    }
+
+    fn check_null_ptr(&mut self, address: &LOperand, location: Location) {
+        if !DO_MEMORY_CHECKS {
+            return;
+        }
+        let ok = self.labelgen.fresh();
+        self.push(
+            Instr::CJump {
+                lhs: address.clone(),
+                op: loc(PseudoOp::NotEq, location.clone()),
+                rhs: loc(Operand::Imm(0), location.clone()),
+                true_target: ok,
+                false_target: LABEL_ABORT_NULL_DEREF,
+                width: ValueWidth::Qword,
+            },
+            location.clone(),
+        );
+        self.push(Instr::Label(ok), location);
+    }
+
+    fn checked_array_address(
+        &mut self,
+        array: LOperand,
+        index: LOperand,
+        element: &RType,
+        location: Location,
+    ) -> LOperand {
+        self.check_null_ptr(&array, location.clone());
+        if DO_MEMORY_CHECKS {
+            let length = self.tempgen.fresh();
+            self.push(
                 Instr::Load {
-                    dest: trans_oper(dest),
-                    address: trans_oper(address),
-                    width: *width,
+                    dest: loc(Operand::Temp(length), location.clone()),
+                    address: array.clone(),
+                    width: ValueWidth::Dword,
                 },
-                src_loc,
-            )),
-            ir_linear::Instr::Store {
-                address,
-                src,
-                width,
-            } => body.push(loc(
-                Instr::Store {
-                    address: trans_oper(address),
-                    src: trans_oper(src),
-                    width: *width,
+                location.clone(),
+            );
+            let nonnegative = self.labelgen.fresh();
+            self.push(
+                Instr::CJump {
+                    lhs: index.clone(),
+                    op: loc(PseudoOp::GreaterEq, location.clone()),
+                    rhs: loc(Operand::Imm(0), location.clone()),
+                    true_target: nonnegative,
+                    false_target: LABEL_ABORT_NULL_DEREF,
+                    width: ValueWidth::Dword,
                 },
-                src_loc,
-            )),
-            ir_linear::Instr::Address {
-                dest,
+                location.clone(),
+            );
+            self.push(Instr::Label(nonnegative), location.clone());
+            let in_bounds = self.labelgen.fresh();
+            self.push(
+                Instr::CJump {
+                    lhs: index.clone(),
+                    op: loc(PseudoOp::Less, location.clone()),
+                    rhs: loc(Operand::Temp(length), location.clone()),
+                    true_target: in_bounds,
+                    false_target: LABEL_ABORT_NULL_DEREF,
+                    width: ValueWidth::Dword,
+                },
+                location.clone(),
+            );
+            self.push(Instr::Label(in_bounds), location.clone());
+        }
+        let dest = self.tempgen.fresh();
+        self.push(
+            Instr::Address {
+                dest: loc(Operand::Temp(dest), location.clone()),
+                base: array,
+                index: Some(index),
+                scale: self.types.layout(element).0 as u8,
+                displacement: 8,
+            },
+            location.clone(),
+        );
+        loc(Operand::Temp(dest), location)
+    }
+
+    fn field_address(&mut self, base: LOperand, typ: &RType, field: &LIdent) -> LOperand {
+        let offset = self.types.field_offset(typ, &field.data);
+        let dest = self.tempgen.fresh();
+        self.push(
+            Instr::Address {
+                dest: loc(Operand::Temp(dest), field.location.clone()),
                 base,
-                index,
-                scale,
-                displacement,
-            } => body.push(loc(
-                Instr::Address {
-                    dest: trans_oper(dest),
-                    base: trans_oper(base),
-                    index: index.as_ref().map(trans_oper),
-                    scale: *scale,
-                    displacement: *displacement,
-                },
-                src_loc,
-            )),
-            ir_linear::Instr::Call {
-                dest,
-                dest_width,
-                callee,
-                args,
-                arg_widths,
-            } => {
-                // r <- call f(a,b,c)
-                //
-                // t0 <- arg0
-                // t1 <- arg1
-                // t2 <- arg2
-                // call f
-                // t3 <- res0
-                for (i, arg) in args.iter().enumerate() {
-                    let (dest, src) = (
-                        loc(Operand::FunctionSlot(FunctionSlot::Arg(i)), src_loc.clone()),
-                        trans_oper(arg),
-                    );
-                    body.push(loc(
-                        Instr::Move {
-                            dest,
-                            src,
-                            width: arg_widths[i],
-                        },
-                        src_loc.clone(),
-                    ));
-                }
+                index: None,
+                scale: 1,
+                displacement: offset,
+            },
+            field.location.clone(),
+        );
+        loc(Operand::Temp(dest), field.location.clone())
+    }
 
-                body.push(loc(
-                    Instr::Call {
-                        callee: callee.clone(),
-                        arg_count: args.len(),
+    fn trans_place(&mut self, value: &LLValue) -> Place {
+        match &value.data {
+            LValue::Ident(name) => Place::Local(
+                *self.env.get(&name.data).unwrap(),
+                self.types.variable_type(&name.data),
+            ),
+            LValue::Deref(pointer) => {
+                let RType::Pointer(typ) = self.get_type(pointer) else {
+                    panic!()
+                };
+                let address = self.trans_expr(pointer);
+                self.check_null_ptr(&address, value.location.clone());
+                Place::Memory(address, *typ)
+            }
+            LValue::Field { base, field } => {
+                let Place::Memory(address, typ) = self.trans_place(base) else {
+                    panic!()
+                };
+                let field_address = self.field_address(address, &typ, field);
+                let field_type = self.types.field_type(&typ, field).unwrap();
+                Place::Memory(field_address, field_type)
+            }
+            LValue::Index { base, index } => {
+                let base_place = self.trans_place(base);
+                let (array, base_type) = self.read_place(&base_place, base.location.clone());
+                let RType::Array(element) = base_type else {
+                    panic!("checked array base")
+                };
+                let index = self.trans_expr(index);
+                let address =
+                    self.checked_array_address(array, index, &element, value.location.clone());
+                Place::Memory(address, *element)
+            }
+        }
+    }
+
+    fn trans_address_of_expr(&mut self, expr: &LExpr) -> LOperand {
+        match &expr.data {
+            AstExpr::Deref(pointer) => {
+                let address = self.trans_expr(pointer);
+                self.check_null_ptr(&address, expr.location.clone());
+                address
+            }
+            AstExpr::Field { ident, field } => {
+                let typ = self.get_type(ident);
+                let base = self.trans_address_of_expr(ident);
+                self.field_address(base, &typ, field)
+            }
+            AstExpr::LValue(value) => {
+                let Place::Memory(address, _) = self.trans_place(value) else {
+                    panic!()
+                };
+                address
+            }
+            _ => panic!(),
+        }
+    }
+
+    fn read_place(&mut self, place: &Place, location: Location) -> (LOperand, RType) {
+        match place {
+            Place::Local(temp, typ) => (loc(Operand::Temp(*temp), location), typ.clone()),
+            // structs in memory return address of struct
+            Place::Memory(address, typ) if matches!(typ, RType::Struct(_)) => {
+                (address.clone(), typ.clone())
+            }
+            // other values in memory require a load into a temporary
+            Place::Memory(address, typ) => {
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::Load {
+                        dest: loc(Operand::Temp(dest), location.clone()),
+                        address: address.clone(),
+                        width: type_width(typ),
                     },
-                    src_loc.clone(),
-                ));
+                    location.clone(),
+                );
+                (loc(Operand::Temp(dest), location), typ.clone())
+            }
+        }
+    }
 
-                if let Some(dest) = dest {
-                    let (dest, src) = (
-                        loc(Operand::Temp(*dest), src_loc.clone()),
-                        loc(
-                            Operand::FunctionSlot(FunctionSlot::ReturnValue),
-                            src_loc.clone(),
-                        ),
-                    );
-                    body.push(loc(
-                        Instr::Move {
-                            dest,
-                            src,
-                            width: dest_width.expect("call result has a width"),
-                        },
-                        src_loc,
-                    ));
-                }
+    fn write_place(&mut self, place: Place, src: LOperand, location: Location) {
+        match place {
+            Place::Local(temp, typ) => self.push(
+                Instr::Move {
+                    dest: loc(Operand::Temp(temp), location.clone()),
+                    src,
+                    width: type_width(&typ),
+                },
+                location,
+            ),
+            Place::Memory(address, typ) => self.push(
+                Instr::Store {
+                    address,
+                    src,
+                    width: type_width(&typ),
+                },
+                location,
+            ),
+        }
+    }
+
+    fn assignment_op(op: AsnOp) -> PseudoOp {
+        match op {
+            AsnOp::PlusEq => PseudoOp::Add,
+            AsnOp::MinusEq => PseudoOp::Sub,
+            AsnOp::TimesEq => PseudoOp::Mul,
+            AsnOp::DivEq => PseudoOp::Div,
+            AsnOp::ModEq => PseudoOp::Mod,
+            AsnOp::AndEq => PseudoOp::BitAnd,
+            AsnOp::OrEq => PseudoOp::BitOr,
+            AsnOp::XorEq => PseudoOp::BitXor,
+            AsnOp::Eq | AsnOp::LShiftEq | AsnOp::RShiftEq => {
+                panic!();
             }
-            ir_linear::Instr::Return(value) => {
-                // res0 <- t0
-                // ret
-                //
-                // or
-                //
-                // ret
-                if let Some(value) = value {
-                    let (dest, src) = (
-                        loc(
-                            Operand::FunctionSlot(FunctionSlot::ReturnValue),
-                            src_loc.clone(),
-                        ),
-                        trans_oper(value),
-                    );
-                    body.push(loc(
-                        Instr::Move {
-                            dest,
-                            src,
-                            width: function.ret_width,
-                        },
-                        src_loc.clone(),
-                    ));
-                }
-                body.push(loc(Instr::Return, src_loc));
-            }
-            ir_linear::Instr::Abort => body.push(loc(Instr::Abort, src_loc)),
-            ir_linear::Instr::Jump(label) => body.push(loc(Instr::Jump(*label), src_loc)),
-            ir_linear::Instr::CJump {
+        }
+    }
+
+    fn trans_call(&mut self, callee: &LExpr, args: &[Box<LExpr>], location: Location) -> LOperand {
+        let RType::Function { params, ret_typ } = self.get_type(callee) else {
+            panic!("analysis checked the call target")
+        };
+        let call_target = if let AstExpr::Ident(name) = &callee.data
+            && !self.env.contains_key(&name.data)
+        {
+            CallTarget::Direct(name.clone())
+        } else {
+            CallTarget::Indirect(self.trans_expr(callee))
+        };
+
+        let mut call_args = Vec::new();
+        // evaluate arguments left to right, call by value
+        for arg in args {
+            call_args.push(self.trans_expr(arg));
+        }
+
+        for (index, arg) in call_args.into_iter().enumerate() {
+            self.push(
+                Instr::Move {
+                    dest: loc(
+                        Operand::FunctionSlot(FunctionSlot::Arg(index)),
+                        location.clone(),
+                    ),
+                    src: arg,
+                    width: type_width(&params[index]),
+                },
+                location.clone(),
+            );
+        }
+
+        self.push(
+            Instr::Call {
+                callee: call_target,
+                arg_count: args.len(),
+            },
+            location.clone(),
+        );
+        let dest = (*ret_typ != RType::Void).then(|| self.tempgen.fresh());
+        if let Some(dest) = dest {
+            self.push(
+                Instr::Move {
+                    dest: loc(Operand::Temp(dest), location.clone()),
+                    src: loc(
+                        Operand::FunctionSlot(FunctionSlot::ReturnValue),
+                        location.clone(),
+                    ),
+                    width: type_width(&ret_typ),
+                },
+                location.clone(),
+            );
+        }
+        loc(dest.map(Operand::Temp).unwrap_or(Operand::Imm(0)), location)
+    }
+
+    fn trans_cond(
+        &mut self,
+        expr: &LExpr,
+        true_target: Label,
+        false_target: Label,
+        location: Location,
+    ) {
+        // optimization: place lhs and rhs in cond directly without generating temps for the lhs and
+        // rhs result
+        if let AstExpr::BinOp { op, lhs, rhs } = &expr.data
+            && Ctx::is_comparison(op)
+        {
+            let large = type_width(&self.get_type(lhs)) == ValueWidth::Qword
+                || type_width(&self.get_type(rhs)) == ValueWidth::Qword;
+            let width = if large {
+                ValueWidth::Qword
+            } else {
+                ValueWidth::Dword
+            };
+            let lhs = self.trans_expr(lhs);
+            let rhs = self.trans_expr(rhs);
+            let comparison = Instr::CJump {
                 lhs,
-                op,
+                op: loc(Ctx::op_to_pseudo(op.data.clone()), op.location.clone()),
                 rhs,
                 true_target,
                 false_target,
                 width,
-            } => body.push(loc(
-                Instr::CJump {
-                    lhs: trans_oper(lhs),
-                    op: op.clone(),
-                    rhs: trans_oper(rhs),
-                    true_target: *true_target,
-                    false_target: *false_target,
-                    width: *width,
-                },
-                src_loc,
-            )),
-            ir_linear::Instr::Label(label) => body.push(loc(Instr::Label(*label), src_loc)),
+            };
+            self.push(comparison, location);
+            return;
+        }
+
+        let cond = self.trans_expr(expr);
+        self.push(
+            // cond == 1 is true
+            Instr::CJump {
+                lhs: cond,
+                op: loc(PseudoOp::EqualEq, expr.location.clone()),
+                rhs: loc(Operand::Imm(1), expr.location.clone()),
+                true_target,
+                false_target,
+                width: ValueWidth::Dword,
+            },
+            location,
+        );
+    }
+
+    fn trans_expr(&mut self, expr: &LExpr) -> LOperand {
+        let source_loc = expr.location.clone();
+
+        match &expr.data {
+            AstExpr::Ident(name) => {
+                if let Some(temp) = self.env.get(&name.data) {
+                    loc(Operand::Temp(*temp), source_loc)
+                } else {
+                    let dest = self.tempgen.fresh();
+                    self.push(
+                        Instr::FunctionAddress {
+                            dest: loc(Operand::Temp(dest), source_loc.clone()),
+                            function: name.clone(),
+                        },
+                        source_loc.clone(),
+                    );
+                    loc(Operand::Temp(dest), source_loc)
+                }
+            }
+            AstExpr::Int(value) => loc(Operand::Imm(*value), source_loc),
+            AstExpr::True => loc(Operand::Imm(1), source_loc),
+            AstExpr::False => loc(Operand::Imm(0), source_loc),
+            AstExpr::Null => loc(Operand::Imm(0), source_loc),
+            AstExpr::LValue(value) => {
+                let place = self.trans_place(value);
+                self.read_place(&place, source_loc).0
+            }
+            AstExpr::Field { .. } | AstExpr::Deref(_) => {
+                let typ = self.get_type(expr);
+                let address = self.trans_address_of_expr(expr);
+                self.read_place(&Place::Memory(address, typ), source_loc).0
+            }
+            AstExpr::Alloc(typ) => {
+                let size = self.types.layout(&self.types.type_of(typ)).0;
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::Move {
+                        dest: loc(
+                            Operand::FunctionSlot(FunctionSlot::Arg(0)),
+                            source_loc.clone(),
+                        ),
+                        src: loc(Operand::Imm(1), source_loc.clone()),
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Move {
+                        dest: loc(
+                            Operand::FunctionSlot(FunctionSlot::Arg(1)),
+                            source_loc.clone(),
+                        ),
+                        src: loc(Operand::Imm(size), source_loc.clone()),
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Call {
+                        callee: CallTarget::Direct(loc("calloc".to_string(), source_loc.clone())),
+                        arg_count: 2,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Move {
+                        dest: loc(Operand::Temp(dest), source_loc.clone()),
+                        src: loc(
+                            Operand::FunctionSlot(FunctionSlot::ReturnValue),
+                            source_loc.clone(),
+                        ),
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                let result = loc(Operand::Temp(dest), source_loc.clone());
+                self.check_null_ptr(&result, source_loc);
+                result
+            }
+            AstExpr::Index { base, index } => {
+                let RType::Array(element) = self.get_type(base) else {
+                    panic!("checked array base")
+                };
+                let array = self.trans_expr(base);
+                let index = self.trans_expr(index);
+                let address =
+                    self.checked_array_address(array, index, &element, source_loc.clone());
+                self.read_place(&Place::Memory(address, *element), source_loc)
+                    .0
+            }
+            AstExpr::AllocArray { typ, size } => {
+                let element = self.types.type_of(typ);
+                let element_size = self.types.layout(&element).0;
+                let length = self.trans_expr(size);
+                if DO_MEMORY_CHECKS {
+                    let valid = self.labelgen.fresh();
+                    self.push(
+                        Instr::CJump {
+                            lhs: length.clone(),
+                            op: loc(PseudoOp::GreaterEq, source_loc.clone()),
+                            rhs: loc(Operand::Imm(0), source_loc.clone()),
+                            true_target: valid,
+                            false_target: LABEL_ABORT_NULL_DEREF,
+                            width: ValueWidth::Dword,
+                        },
+                        source_loc.clone(),
+                    );
+                    self.push(Instr::Label(valid), source_loc.clone());
+                    let valid_size = self.labelgen.fresh();
+                    self.push(
+                        Instr::CJump {
+                            lhs: length.clone(),
+                            op: loc(PseudoOp::LessEq, source_loc.clone()),
+                            rhs: loc(
+                                Operand::Imm((i32::MAX - 8) / element_size),
+                                source_loc.clone(),
+                            ),
+                            true_target: valid_size,
+                            false_target: LABEL_ABORT_NULL_DEREF,
+                            width: ValueWidth::Dword,
+                        },
+                        source_loc.clone(),
+                    );
+                    self.push(Instr::Label(valid_size), source_loc.clone());
+                }
+                let bytes = self.tempgen.fresh();
+                self.push(
+                    Instr::BinOp {
+                        dest: loc(Operand::Temp(bytes), source_loc.clone()),
+                        lhs: length.clone(),
+                        op: loc(PseudoOp::Mul, source_loc.clone()),
+                        rhs: loc(Operand::Imm(element_size), source_loc.clone()),
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                let total = self.tempgen.fresh();
+                self.push(
+                    Instr::BinOp {
+                        dest: loc(Operand::Temp(total), source_loc.clone()),
+                        lhs: loc(Operand::Temp(bytes), source_loc.clone()),
+                        op: loc(PseudoOp::Add, source_loc.clone()),
+                        rhs: loc(Operand::Imm(8), source_loc.clone()),
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::Move {
+                        dest: loc(
+                            Operand::FunctionSlot(FunctionSlot::Arg(0)),
+                            source_loc.clone(),
+                        ),
+                        src: loc(Operand::Imm(1), source_loc.clone()),
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Move {
+                        dest: loc(
+                            Operand::FunctionSlot(FunctionSlot::Arg(1)),
+                            source_loc.clone(),
+                        ),
+                        src: loc(Operand::Temp(total), source_loc.clone()),
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Call {
+                        callee: CallTarget::Direct(loc("calloc".to_string(), source_loc.clone())),
+                        arg_count: 2,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Move {
+                        dest: loc(Operand::Temp(dest), source_loc.clone()),
+                        src: loc(
+                            Operand::FunctionSlot(FunctionSlot::ReturnValue),
+                            source_loc.clone(),
+                        ),
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                let array = loc(Operand::Temp(dest), source_loc.clone());
+                self.check_null_ptr(&array, source_loc.clone());
+                self.push(
+                    Instr::Store {
+                        address: array.clone(),
+                        src: length,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc,
+                );
+                array
+            }
+            AstExpr::Dealloc(value) => {
+                let value = self.trans_expr(value);
+                self.push(
+                    Instr::Move {
+                        dest: loc(
+                            Operand::FunctionSlot(FunctionSlot::Arg(0)),
+                            source_loc.clone(),
+                        ),
+                        src: value,
+                        width: ValueWidth::Qword,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(
+                    Instr::Call {
+                        callee: CallTarget::Direct(loc("free".to_string(), source_loc.clone())),
+                        arg_count: 1,
+                    },
+                    source_loc.clone(),
+                );
+                loc(Operand::Imm(0), source_loc)
+            }
+            AstExpr::ArrayLength(array) => {
+                let address = self.trans_expr(array);
+                self.check_null_ptr(&address, source_loc.clone());
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::Load {
+                        dest: loc(Operand::Temp(dest), source_loc.clone()),
+                        address,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                loc(Operand::Temp(dest), source_loc)
+            }
+            AstExpr::BinOp { op, lhs, rhs } => {
+                // evaluate left to right
+                let large = type_width(&self.get_type(lhs)) == ValueWidth::Qword
+                    || type_width(&self.get_type(rhs)) == ValueWidth::Qword;
+                let width = if large {
+                    ValueWidth::Qword
+                } else {
+                    ValueWidth::Dword
+                };
+                let lhs = self.trans_expr(lhs);
+                let rhs = self.trans_expr(rhs);
+                let dest = self.tempgen.fresh();
+                let ir = Instr::BinOp {
+                    dest: loc(Operand::Temp(dest), source_loc.clone()),
+                    lhs,
+                    op: loc(Self::op_to_pseudo(op.data.clone()), op.location.clone()),
+                    rhs,
+                    width,
+                };
+                self.push(ir, source_loc.clone());
+                loc(Operand::Temp(dest), source_loc)
+            }
+            AstExpr::TernOp {
+                cond,
+                true_expr,
+                false_expr,
+            } => {
+                let result = self.tempgen.fresh();
+                let label_true = self.labelgen.fresh();
+                let label_false = self.labelgen.fresh();
+                let label_end = self.labelgen.fresh();
+                self.trans_cond(cond, label_true, label_false, source_loc.clone());
+
+                // true branch
+                self.push(Instr::Label(label_true), source_loc.clone());
+                let true_value = self.trans_expr(true_expr);
+                let width = type_width(&self.get_type(expr));
+                self.push(
+                    Instr::Move {
+                        dest: loc(Operand::Temp(result), source_loc.clone()),
+                        src: true_value,
+                        width,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(Instr::Jump(label_end), source_loc.clone());
+
+                // false branch
+                self.push(Instr::Label(label_false), source_loc.clone());
+                let false_value = self.trans_expr(false_expr);
+                self.push(
+                    Instr::Move {
+                        dest: loc(Operand::Temp(result), source_loc.clone()),
+                        src: false_value,
+                        width,
+                    },
+                    source_loc.clone(),
+                );
+                self.push(Instr::Jump(label_end), source_loc.clone());
+                self.push(Instr::Label(label_end), source_loc);
+                loc(Operand::Temp(result), expr.location.clone())
+            }
+            AstExpr::Call { callee, args } => self.trans_call(callee, args, source_loc),
         }
     }
 
-    Function {
-        name: function.name.clone(),
-        params: function.params.clone(),
-        body: Program(body),
+    fn is_comparison(op: &LBinOp) -> bool {
+        matches!(
+            op.data,
+            BinOp::Greater
+                | BinOp::GreaterEq
+                | BinOp::Less
+                | BinOp::LessEq
+                | BinOp::EqualEq
+                | BinOp::NotEq
+        )
+    }
+
+    fn op_to_pseudo(op: BinOp) -> PseudoOp {
+        match op {
+            BinOp::Plus => PseudoOp::Add,
+            BinOp::Minus => PseudoOp::Sub,
+            BinOp::Times => PseudoOp::Mul,
+            BinOp::Div => PseudoOp::Div,
+            BinOp::Mod => PseudoOp::Mod,
+            BinOp::BitAnd => PseudoOp::BitAnd,
+            BinOp::BitOr => PseudoOp::BitOr,
+            BinOp::BitXor => PseudoOp::BitXor,
+
+            BinOp::Greater => PseudoOp::Greater,
+            BinOp::GreaterEq => PseudoOp::GreaterEq,
+            BinOp::Less => PseudoOp::Less,
+            BinOp::LessEq => PseudoOp::LessEq,
+            BinOp::EqualEq => PseudoOp::EqualEq,
+            BinOp::NotEq => PseudoOp::NotEq,
+
+            _ => panic!("op not supported"),
+        }
+    }
+
+    fn trans_block(&mut self, block: &LBlock) -> Flow {
+        for stmt in &block.data.0 {
+            let flow = self.trans_stmt(stmt);
+
+            // don't emit unreachable code
+            if !flow.falls_through() {
+                return flow;
+            }
+        }
+
+        Flow::FallsThrough
+    }
+
+    // doesn't automatically push statements to stmts
+    fn trans_branch(&mut self, block: Option<&LBlock>) -> (Vec<LInstr>, Flow) {
+        let Some(block) = block else {
+            return (Vec::new(), Flow::FallsThrough);
+        };
+
+        let mut branch_ctx = Ctx {
+            env: self.env.clone(),
+            types: self.types.clone(),
+            ret_width: self.ret_width,
+            tempgen: self.tempgen,
+            labelgen: self.labelgen,
+            loop_stack: self.loop_stack.clone(),
+            stmts: Vec::new(),
+        };
+        let flow = branch_ctx.trans_block(block);
+        (branch_ctx.stmts, flow)
+    }
+
+    fn trans_return(&mut self, expr: Option<&LExpr>, location: Location) -> Flow {
+        if let Some(expr) = expr {
+            let value = self.trans_expr(expr);
+            self.push(
+                Instr::Move {
+                    dest: loc(
+                        Operand::FunctionSlot(FunctionSlot::ReturnValue),
+                        location.clone(),
+                    ),
+                    src: value,
+                    width: self.ret_width,
+                },
+                location.clone(),
+            );
+        }
+        self.push(Instr::Return, location);
+
+        Flow::Terminates
+    }
+
+    fn trans_if(
+        &mut self,
+        cond: &LExpr,
+        true_block: &LBlock,
+        false_block: Option<&LBlock>,
+        location: Location,
+    ) -> Flow {
+        let label_true = self.labelgen.fresh();
+        let label_false = self.labelgen.fresh();
+        self.trans_cond(cond, label_true, label_false, location.clone());
+
+        let (false_stmts, false_flow) = self.trans_branch(false_block);
+        let (true_stmts, true_flow) = self.trans_branch(Some(true_block));
+        let false_fallthrough = false_flow.falls_through();
+        let true_fallthrough = true_flow.falls_through();
+
+        // if both blocks terminate we don't need a label_end
+        let label_end = if true_fallthrough || false_fallthrough {
+            Some(self.labelgen.fresh())
+        } else {
+            None
+        };
+
+        self.push(Instr::Label(label_true), location.clone());
+        self.stmts.extend(true_stmts);
+        if true_fallthrough && let Some(label_end) = label_end {
+            self.push(Instr::Jump(label_end), location.clone());
+        }
+
+        self.push(Instr::Label(label_false), location.clone());
+        self.stmts.extend(false_stmts);
+        if false_fallthrough && let Some(label_end) = label_end {
+            self.push(Instr::Jump(label_end), location.clone());
+        }
+
+        if let Some(label_end) = label_end {
+            self.push(Instr::Label(label_end), location);
+        }
+
+        if true_fallthrough || false_fallthrough {
+            Flow::FallsThrough
+        } else {
+            Flow::Terminates
+        }
+    }
+
+    fn trans_while(&mut self, cond: &LExpr, body: &LBlock, location: Location) -> Flow {
+        let label_body = self.labelgen.fresh();
+        let label_cond = self.labelgen.fresh();
+        let label_exit = self.labelgen.fresh();
+
+        self.loop_stack.push(LoopLabels {
+            break_label: label_exit,
+            continue_label: label_cond,
+        });
+
+        self.push(Instr::Label(label_cond), location.clone());
+        self.trans_cond(cond, label_body, label_exit, location.clone());
+        self.push(Instr::Label(label_body), location.clone());
+
+        let body_flow = self.trans_block(body);
+        if body_flow.falls_through() {
+            self.push(Instr::Jump(label_cond), location.clone());
+        }
+
+        self.loop_stack.pop().expect("loops are good");
+        self.push(Instr::Label(label_exit), location);
+
+        Flow::FallsThrough
+    }
+
+    fn trans_for(
+        &mut self,
+        init: Option<&LStmt>,
+        cond: &LExpr,
+        step: Option<&LStmt>,
+        body: &LBlock,
+        location: Location,
+    ) -> Flow {
+        if let Some(init) = init {
+            let init_flow = self.trans_stmt(init);
+            if !init_flow.falls_through() {
+                return init_flow;
+            }
+        }
+
+        let label_body = self.labelgen.fresh();
+        let label_cond = self.labelgen.fresh();
+        let label_step = self.labelgen.fresh();
+        let label_exit = self.labelgen.fresh();
+
+        self.push(Instr::Label(label_cond), location.clone());
+        self.trans_cond(cond, label_body, label_exit, location.clone());
+        self.push(Instr::Label(label_body), location.clone());
+
+        self.loop_stack.push(LoopLabels {
+            break_label: label_exit,
+            continue_label: label_step,
+        });
+        let body_flow = self.trans_block(body);
+        self.loop_stack.pop().expect("loops are good");
+
+        if body_flow.falls_through() {
+            self.push(Instr::Jump(label_step), location.clone());
+        }
+
+        self.push(Instr::Label(label_step), location.clone());
+        let step_flow = if let Some(step) = step {
+            self.trans_stmt(step)
+        } else {
+            Flow::FallsThrough
+        };
+        if step_flow.falls_through() {
+            self.push(Instr::Jump(label_cond), location.clone());
+        }
+
+        self.push(Instr::Label(label_exit), location);
+
+        Flow::FallsThrough
+    }
+
+    fn trans_decl(&mut self, name: &LIdent, block: &LBlock) -> Flow {
+        let temp = self.tempgen.fresh();
+        // add and remove var from scope
+        self.env.insert(name.data.clone(), temp);
+        let flow = self.trans_block(block);
+        self.env.remove(&name.data);
+        self.types.erase_variable(&name.data);
+        flow
+    }
+
+    fn trans_assign(&mut self, name: &LLValue, value: &LExpr, location: Location) -> Flow {
+        let place = self.trans_place(name);
+        let src = self.trans_expr(value);
+        self.write_place(place, src, location);
+
+        Flow::FallsThrough
+    }
+
+    fn trans_loop_jump(&mut self, label: Label, location: Location) -> Flow {
+        self.push(Instr::Jump(label), location);
+        Flow::Terminates
+    }
+
+    fn trans_assert(&mut self, expr: &LExpr, location: Location) -> Flow {
+        let label_ok = self.labelgen.fresh();
+        let label_abort = self.labelgen.fresh();
+        let label_end = self.labelgen.fresh();
+        self.trans_cond(expr, label_ok, label_abort, location.clone());
+
+        self.push(Instr::Label(label_ok), location.clone());
+        self.push(Instr::Jump(label_end), location.clone());
+        self.push(Instr::Label(label_abort), location.clone());
+        self.push(Instr::Abort, location.clone());
+        self.push(Instr::Label(label_end), location);
+
+        Flow::FallsThrough // assume assert always passes
+    }
+
+    fn trans_stmt(&mut self, stmt: &LStmt) -> Flow {
+        let source_loc = stmt.location.clone();
+
+        match &stmt.data {
+            AstStmt::Decl { typ, name, block } => {
+                self.types.assign_type(name.data.clone(), typ);
+                self.trans_decl(name, block)
+            }
+            AstStmt::Assign { name, value } => self.trans_assign(name, value, source_loc),
+            AstStmt::CompoundAssign { name, op, value } => {
+                let place = self.trans_place(name);
+                let old = self.read_place(&place, source_loc.clone()).0;
+                let rhs = self.trans_expr(value);
+                let dest = self.tempgen.fresh();
+                self.push(
+                    Instr::BinOp {
+                        dest: loc(Operand::Temp(dest), source_loc.clone()),
+                        lhs: old,
+                        op: loc(Self::assignment_op(op.data.clone()), op.location.clone()),
+                        rhs,
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                self.write_place(
+                    place,
+                    loc(Operand::Temp(dest), source_loc.clone()),
+                    source_loc,
+                );
+                Flow::FallsThrough
+            }
+            AstStmt::Postfix { name, op } => {
+                let place = self.trans_place(name);
+                let old = self.read_place(&place, source_loc.clone()).0;
+                let dest = self.tempgen.fresh();
+                let operation = match op.data {
+                    PostOp::DoublePlus => PseudoOp::Add,
+                    PostOp::DoubleMinus => PseudoOp::Sub,
+                };
+                self.push(
+                    Instr::BinOp {
+                        dest: loc(Operand::Temp(dest), source_loc.clone()),
+                        lhs: old,
+                        op: loc(operation, op.location.clone()),
+                        rhs: loc(Operand::Imm(1), source_loc.clone()),
+                        width: ValueWidth::Dword,
+                    },
+                    source_loc.clone(),
+                );
+                self.write_place(
+                    place,
+                    loc(Operand::Temp(dest), source_loc.clone()),
+                    source_loc,
+                );
+                Flow::FallsThrough
+            }
+            AstStmt::Return(expr) => self.trans_return(expr.as_ref(), source_loc),
+            AstStmt::If {
+                cond,
+                true_block,
+                false_block,
+            } => self.trans_if(cond, true_block, false_block.as_ref(), source_loc),
+            AstStmt::While { cond, body } => self.trans_while(cond, body, source_loc),
+            AstStmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => self.trans_for(init.as_deref(), cond, step.as_deref(), body, source_loc),
+            AstStmt::Expr(expr) => {
+                self.trans_expr(expr);
+                Flow::FallsThrough
+            }
+            AstStmt::Break => {
+                self.trans_loop_jump(self.current_loop_labels().break_label, source_loc)
+            }
+            AstStmt::Continue => {
+                self.trans_loop_jump(self.current_loop_labels().continue_label, source_loc)
+            }
+            AstStmt::Assert(expr) => self.trans_assert(expr, source_loc),
+            AstStmt::Block(block) => self.trans_block(block),
+        }
+    }
+    fn current_loop_labels(&self) -> LoopLabels {
+        *self.loop_stack.last().expect("loop labels exist")
     }
 }
 
-pub fn translate(module: &ir_linear::Module) -> Module {
-    Module {
-        functions: module.functions.iter().map(trans_function).collect(),
+// remove fallthrough, add explicit jumps
+fn make_jumps_explicit(stmts: Vec<LInstr>) -> Vec<LInstr> {
+    let mut result: Vec<LInstr> = Vec::new();
+
+    for instr in stmts {
+        if let Instr::Label(label) = &instr.data
+            && result.last().is_some_and(|prev| {
+                !matches!(
+                    prev.data,
+                    Instr::Jump(_) | Instr::CJump { .. } | Instr::Return | Instr::Abort
+                )
+            })
+        {
+            result.push(loc(Instr::Jump(*label), instr.location.clone()));
+        }
+        result.push(instr);
     }
+
+    result
+}
+
+pub fn translate(
+    ast: &AstProgram,
+    types: &Env,
+    temps: &mut TempGen,
+    labels: &mut LabelGen,
+) -> Module {
+    let mut functions = Vec::new();
+
+    for gdecl in &ast.0 {
+        // don't translate typedefs or function declarations
+        let GlobalDecl::FunDef {
+            ret_typ,
+            name,
+            params,
+            body: Some(body),
+        } = &gdecl.data
+        else {
+            continue;
+        };
+
+        let mut ctx = Ctx {
+            env: HashMap::new(),
+            types: types.clone(),
+            ret_width: type_width(&types.type_of(ret_typ)),
+            tempgen: temps,
+            labelgen: labels,
+            loop_stack: Vec::new(),
+            stmts: Vec::new(),
+        };
+
+        // translate parameters first
+        let mut param_temps = Vec::new();
+        for param in params {
+            let temp = ctx.tempgen.fresh();
+            ctx.env.insert(param.data.name.data.clone(), temp);
+            ctx.types
+                .assign_type(param.data.name.data.clone(), &param.data.typ);
+            param_temps.push(temp);
+        }
+
+        // then translate the body
+        ctx.trans_block(body);
+
+        let mut function_body = make_jumps_explicit(ctx.stmts);
+
+        // add one abort location PER FUNCTION at the end
+        // this is so cfg analysis works
+        // the duplicate labels are removed when assembly is actually emitted
+        let abort_location = body.location.clone();
+        if DO_MEMORY_CHECKS {
+            function_body.push(loc(
+                Instr::Label(LABEL_ABORT_NULL_DEREF),
+                abort_location.clone(),
+            ));
+            function_body.push(loc(Instr::Abort, abort_location));
+        }
+
+        let param_location = function_body
+            .first()
+            .map(|instr| instr.location.clone())
+            .unwrap_or_else(|| name.location.clone());
+        let mut param_moves = Vec::new();
+        for (index, (param, temp)) in params.iter().zip(&param_temps).enumerate() {
+            param_moves.push(loc(
+                Instr::Move {
+                    dest: loc(Operand::Temp(*temp), param_location.clone()),
+                    src: loc(
+                        Operand::FunctionSlot(FunctionSlot::Arg(index)),
+                        param_location.clone(),
+                    ),
+                    width: type_width(&types.type_of(&param.data.typ)),
+                },
+                param_location.clone(),
+            ));
+        }
+        param_moves.extend(function_body);
+
+        functions.push(Function {
+            name: name.clone(),
+            params: param_temps,
+            body: Program(param_moves),
+        });
+    }
+
+    Module { functions }
 }
 
 impl fmt::Display for Operand {
@@ -362,7 +1271,6 @@ impl fmt::Display for Operand {
         match self {
             Self::Imm(n) => write!(f, "{n}"),
             Self::Temp(t) => write!(f, "{t}"),
-            Self::Register(r) => f.write_str(abstract_name(*r)),
             Self::StackArgIndex(i) => write!(f, "stack_arg{i}"),
             Self::FunctionSlot(a) => write!(f, "{a}"),
         }
@@ -422,9 +1330,13 @@ impl fmt::Display for Instr {
                 write!(f, ")")
             }
             Self::Return => f.write_str("return"),
-            Self::Call { callee, .. } => write!(f, "call {callee}"),
-            Self::Push(r) => write!(f, "push {}", abstract_name(*r)),
-            Self::Pop(r) => write!(f, "pop {}", abstract_name(*r)),
+            Self::FunctionAddress { dest, function } => {
+                write!(f, "{dest} ← function_address {function}")
+            }
+            Self::Call { callee, .. } => match callee {
+                CallTarget::Direct(name) => write!(f, "call {name}"),
+                CallTarget::Indirect(target) => write!(f, "call *{target}"),
+            },
             Self::Abort => f.write_str("abort"),
             Self::Jump(label) => write!(f, "jump {label}"),
             Self::CJump {
@@ -486,5 +1398,35 @@ impl fmt::Display for Module {
             }
         }
         Ok(())
+    }
+}
+
+impl fmt::Display for Temp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "t{}", self.0)
+    }
+}
+
+impl fmt::Display for PseudoOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let op = match self {
+            PseudoOp::Add => "add",
+            PseudoOp::Sub => "sub",
+            PseudoOp::Mul => "mul",
+            PseudoOp::Div => "div",
+            PseudoOp::Mod => "mod",
+            PseudoOp::And => "and",
+            PseudoOp::Or => "or",
+            PseudoOp::BitAnd => "bitand",
+            PseudoOp::BitOr => "bitor",
+            PseudoOp::BitXor => "bitxor",
+            PseudoOp::Less => "<",
+            PseudoOp::LessEq => "<=",
+            PseudoOp::Greater => ">",
+            PseudoOp::GreaterEq => ">=",
+            PseudoOp::EqualEq => "==",
+            PseudoOp::NotEq => "!=",
+        };
+        write!(f, "{op}")
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::ast_parse::{
     AsnOp, BinOp, Block, Control, Decl, Expr, GlobalDecl, LAsnOp, LBlock, LControl, LDecl, LExpr,
-    LGlobalDecl, LIdent, LLValue, LParam, LProgram, LRetTyp, LSimp, LStmt, LStructField, LTyp,
-    LValue, Param, PostOp, Program, RetTyp, Simp, Stmt, StructField, Typ, UnOp,
+    LGlobalDecl, LIdent, LLValue, LParam, LProgram, LSimp, LStmt, LStructField, LTyp, LValue,
+    Param, PostOp, Program, Simp, Stmt, StructField, Typ, UnOp,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::location::{Located, Location, loc};
@@ -166,6 +166,7 @@ impl Parser {
                     | Token::Int
                     | Token::Bool
                     | Token::Void
+                    | Token::Fn
                     | Token::Struct
                     | Token::Ident(_)
             )
@@ -283,17 +284,13 @@ impl Parser {
         Ok(loc(body, self.start_to_last(start)))
     }
 
-    fn parse_ret_typ(&mut self) -> ParseResult<LRetTyp> {
+    fn parse_ret_typ(&mut self) -> ParseResult<LTyp> {
         match self.peek() {
             Some(Token::Void) => {
                 let token = self.try_consume(&Token::Void)?;
-                Ok(loc(RetTyp::Void, token.location))
+                Ok(loc(Typ::Void, token.location))
             }
-            _ => {
-                let typ = self.parse_typ()?;
-                let location = typ.location.clone();
-                Ok(loc(RetTyp::Typ(typ), location))
-            }
+            _ => self.parse_typ(),
         }
     }
 
@@ -369,6 +366,13 @@ impl Parser {
                 let token = self.try_consume(&Token::Bool)?;
                 loc(Typ::Bool, token.location)
             }
+            Some(Token::Fn) => self.parse_function_typ()?,
+            Some(Token::LParen) => {
+                self.try_consume(&Token::LParen)?;
+                let typ = self.parse_typ()?;
+                self.try_consume(&Token::RParen)?;
+                typ
+            }
             Some(Token::Struct) => {
                 let start = self.try_consume(&Token::Struct)?.location;
                 let name = self.parse_ident()?;
@@ -414,6 +418,32 @@ impl Parser {
         }
 
         Ok(typ)
+    }
+
+    fn parse_function_typ(&mut self) -> ParseResult<LTyp> {
+        let start = self.try_consume(&Token::Fn)?.location;
+        self.try_consume(&Token::LParen)?;
+
+        let mut params = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            params.push(self.parse_typ()?);
+            while self.peek() == Some(&Token::Comma) {
+                self.next();
+                params.push(self.parse_typ()?);
+            }
+        }
+        self.try_consume(&Token::RParen)?;
+        self.try_consume(&Token::Arrow)?;
+
+        let ret_typ = self.parse_ret_typ()?;
+        let location = start.merge(&ret_typ.location);
+        Ok(loc(
+            Typ::Function {
+                params,
+                ret_typ: Box::new(ret_typ),
+            },
+            location,
+        ))
     }
 
     fn parse_stmt(&mut self) -> ParseResult<LStmt> {
@@ -586,6 +616,10 @@ impl Parser {
                 let decl = self.parse_decl()?;
                 Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
             }
+            Some(Token::Fn) => {
+                let decl = self.parse_decl()?;
+                Ok(loc(Simp::Decl(decl), self.start_to_last(start)))
+            }
             Some(Token::Ident(name)) => match self.peek2() {
                 // check if the first identifier was actually a type from a typedef
                 // if so, then <ident> <ident> is the start of a variable declaration
@@ -600,6 +634,7 @@ impl Parser {
                 _ => self.parse_expr_or_assign(),
             },
             Some(Token::LParen) => self.parse_expr_or_assign(),
+            Some(Token::Star) => self.parse_expr_or_assign(),
             _ => Ok(loc(
                 Simp::Expr(self.parse_expr()?),
                 self.start_to_last(start),
@@ -668,26 +703,31 @@ impl Parser {
         }
     }
 
-    fn parse_call(&mut self, name: LIdent) -> ParseResult<LExpr> {
-        self.try_consume(&Token::LParen)?;
-
+    fn parse_call_args(&mut self) -> ParseResult<Vec<LExpr>> {
         let mut args = Vec::new();
         if self.peek() != Some(&Token::RParen) {
             loop {
                 args.push(self.parse_expr()?);
-
                 if self.peek() != Some(&Token::Comma) {
                     break;
                 }
-
                 self.next(); // comma
             }
         }
+        Ok(args)
+    }
 
+    fn parse_call(&mut self, callee: LExpr) -> ParseResult<LExpr> {
+        let args = self.parse_call_args()?;
         let end = self.try_consume(&Token::RParen)?.location;
-
-        let location = name.location.clone().merge(&end);
-        Ok(loc(Expr::FunCall { name, args }, location))
+        let location = callee.location.clone().merge(&end);
+        Ok(loc(
+            Expr::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            location,
+        ))
     }
 
     fn parse_expr_or_assign(&mut self) -> ParseResult<LSimp> {
@@ -789,6 +829,7 @@ impl Parser {
 
                 let op = self.next().unwrap().data;
                 lhs = match op {
+                    Token::LParen => self.parse_call(lhs)?,
                     Token::LBracket => {
                         let index = self.parse_expr()?;
                         let end = self.try_consume(&Token::RBracket)?.location;
@@ -919,7 +960,13 @@ impl Parser {
                     self.start_to_last(start),
                 ))
             }
-            Token::LengthArray => {
+            Token::Dealloc => {
+                self.try_consume(&Token::LParen)?;
+                let value = self.parse_expr()?;
+                self.try_consume(&Token::RParen)?;
+                Ok(loc(Expr::Dealloc(Box::new(value)), self.start_to_last(start)))
+            }
+            Token::ArrayLength => {
                 self.try_consume(&Token::LParen)?;
                 let array = self.parse_expr()?;
                 self.try_consume(&Token::RParen)?;
@@ -927,9 +974,6 @@ impl Parser {
                     Expr::ArrayLength(Box::new(array)),
                     self.start_to_last(start),
                 ))
-            }
-            Token::Ident(name) if self.peek() == Some(&Token::LParen) => {
-                self.parse_call(loc(name, start))
             }
             Token::Ident(name) => Ok(loc(Expr::Ident(loc(name, start.clone())), start)),
             Token::LParen => {
@@ -1008,7 +1052,7 @@ fn prefix_bp(tok: &Token) -> Option<u8> {
 
 fn postfix_bp(tok: &Token) -> Option<u8> {
     match tok {
-        Token::Dot | Token::Arrow | Token::LBracket => Some(26),
+        Token::Dot | Token::Arrow | Token::LBracket | Token::LParen => Some(26),
         _ => None,
     }
 }
